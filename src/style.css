@@ -2642,6 +2642,45 @@ kbd {
   padding: 0 12px;
 }
 
+.keyword-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.keyword-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+.keyword-chip-rm {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.keyword-chip-rm:hover {
+  color: var(--status-down);
+}
+
+.keyword-clear-btn {
+  margin-left: 4px;
+}
+
 /* Custom Bangs Manager */
 .bang-form {
   display: grid;

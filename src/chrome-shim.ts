@@ -205,9 +205,9 @@ function installChromeShim(): void {
       getManifest() {
         return {
           manifest_version: 3,
-          name: 'Start',
+          name: 'Solid',
           version: '1.1.0',
-          description: 'A modern, customizable new tab page with shortcuts and price ticker.'
+          description: 'A minimalist, customizable new tab page with shortcuts, live telemetry, and workspace modules.'
         };
       },
       reload() {

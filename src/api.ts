@@ -43,6 +43,7 @@ export interface RssFeedItem {
   title: string;
   link: string;
   pubDate: number;
+  description?: string;
 }
 
 export interface NewsArticle {
@@ -50,6 +51,8 @@ export interface NewsArticle {
   url: string;
   sourceName: string;
   sourceDomain: string;
+  matchedKeyword?: string;
+  noKeywordMatch?: boolean;
 }
 
 interface BrsApiItem {
@@ -90,6 +93,61 @@ function cleanHeadline(raw: string, sourceName?: string): string {
   return txt.replace(new RegExp(`\\s*[-–|]\\s*${escaped}$`, 'i'), '').trim() || txt;
 }
 
+function stripHtmlTags(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+interface IranMonitorEvent {
+  id?: string;
+  title?: string;
+  summary?: string;
+  event_timestamp?: string;
+  category?: string;
+  tags?: string[];
+  source_urls?: string[];
+  source_details?: Array<{ url?: string; display_name?: string }>;
+}
+
+function parseJsonFeed(rawText: string, feedUrl: string): { title: string; items: RssFeedItem[] } | null {
+  const trimmed = rawText.trimStart();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as { data?: IranMonitorEvent[] } | IranMonitorEvent[];
+    const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : [];
+    if (rows.length === 0) return null;
+
+    const fallbackUrl = feedUrl.includes('iranmonitor.org')
+      ? 'https://www.iranmonitor.org'
+      : feedUrl;
+
+    const items: RssFeedItem[] = [];
+    for (const ev of rows) {
+      const title = typeof ev.title === 'string' ? ev.title.trim() : '';
+      if (!title) continue;
+      const link =
+        ev.source_urls?.find((u) => typeof u === 'string' && /^https?:\/\//i.test(u)) ||
+        ev.source_details?.find((s) => typeof s.url === 'string' && /^https?:\/\//i.test(s.url))?.url ||
+        fallbackUrl;
+      const metaParts = [
+        ev.summary || '',
+        ev.category || '',
+        ...(Array.isArray(ev.tags) ? ev.tags : [])
+      ].filter(Boolean);
+      items.push({
+        title,
+        link,
+        pubDate: parseDateSafe(ev.event_timestamp),
+        description: metaParts.join(' ')
+      });
+    }
+
+    return items.length > 0 ? { title: 'Iran Monitor', items } : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseRssXml(xmlText: string): { title: string; items: RssFeedItem[] } {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, 'application/xml');
@@ -117,8 +175,9 @@ function parseRssXml(xmlText: string): { title: string; items: RssFeedItem[] } {
         node.querySelector('pubDate')?.textContent ||
         node.querySelector('date')?.textContent ||
         '';
+      const description = stripHtmlTags(node.querySelector('description')?.textContent);
       if (title && link) {
-        items.push({ title, link, pubDate: parseDateSafe(pubRaw) });
+        items.push({ title, link, pubDate: parseDateSafe(pubRaw), description });
       }
     }
     return { title: channelTitle, items };
@@ -135,12 +194,25 @@ function parseRssXml(xmlText: string): { title: string; items: RssFeedItem[] } {
       node.querySelector('published')?.textContent ||
       node.querySelector('updated')?.textContent ||
       '';
+    const description = stripHtmlTags(
+      node.querySelector('summary')?.textContent || node.querySelector('content')?.textContent
+    );
     if (title && link) {
-      items.push({ title, link, pubDate: parseDateSafe(pubRaw) });
+      items.push({ title, link, pubDate: parseDateSafe(pubRaw), description });
     }
   }
 
   return { title: channelTitle, items };
+}
+
+function findMatchingKeyword(item: RssFeedItem, keywords: string[]): string | null {
+  const haystack = `${item.title} ${item.description || ''}`.toLowerCase();
+  for (const kw of keywords) {
+    if (haystack.includes(kw.toLowerCase())) {
+      return kw;
+    }
+  }
+  return null;
 }
 
 export class ApiClient {
@@ -194,14 +266,18 @@ export class ApiClient {
     });
   }
 
-  // Direct XML RSS/Atom fetch with rss2json fallback
+  // Direct JSON / XML RSS/Atom fetch with rss2json fallback
   static async fetchRssFeed(
     feedUrl: string
   ): Promise<{ title: string; items: RssFeedItem[] }> {
-    // 1. Direct XML parse (fast, no rate limits, works for Google News & Iran Monitor)
+    // 1. Direct JSON API (e.g. Iran Monitor /api/events) or XML RSS/Atom parse
     try {
-      const xml = await this.fetchRawRssXml(feedUrl);
-      const parsed = parseRssXml(xml);
+      const raw = await this.fetchRawRssXml(feedUrl);
+      const jsonParsed = parseJsonFeed(raw, feedUrl);
+      if (jsonParsed && jsonParsed.items.length > 0) {
+        return jsonParsed;
+      }
+      const parsed = parseRssXml(raw);
       if (parsed.items.length > 0) {
         return parsed;
       }
@@ -217,10 +293,11 @@ export class ApiClient {
       if (data.status === 'ok' && Array.isArray(data.items)) {
         const items: RssFeedItem[] = data.items
           .filter((i: { title?: string; link?: string }) => i.title && i.link)
-          .map((i: { title: string; link: string; pubDate?: string }) => ({
+          .map((i: { title: string; link: string; pubDate?: string; description?: string }) => ({
             title: i.title.trim(),
             link: i.link.trim(),
-            pubDate: parseDateSafe(i.pubDate)
+            pubDate: parseDateSafe(i.pubDate),
+            description: stripHtmlTags(i.description)
           }));
         return { title: data.feed?.title || '', items };
       }
@@ -235,6 +312,10 @@ export class ApiClient {
 
   static async fetchNews(newsSettings?: NewsSettings): Promise<NewsArticle | null> {
     const sourceId = newsSettings?.sourceId || 'bbc-world';
+    const keywords = (newsSettings?.keywords || [])
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+
     let feedUrl = '';
     let sourceName = '';
     let sourceDomain = '';
@@ -259,10 +340,11 @@ export class ApiClient {
       fallbackSiteUrl = source.siteUrl;
     }
 
-    try {
-      const feed = await this.fetchRssFeed(feedUrl);
-      if (feed.items.length > 0) {
-        const sorted = [...feed.items].sort((a, b) => b.pubDate - a.pubDate);
+    const pickFromItems = (items: RssFeedItem[]): NewsArticle | null => {
+      if (items.length === 0) return null;
+      const sorted = [...items].sort((a, b) => b.pubDate - a.pubDate);
+
+      if (keywords.length === 0) {
         const top = sorted[0];
         return {
           title: cleanHeadline(top.title, sourceName),
@@ -271,8 +353,55 @@ export class ApiClient {
           sourceDomain
         };
       }
+
+      for (const item of sorted) {
+        const hit = findMatchingKeyword(item, keywords);
+        if (hit) {
+          return {
+            title: cleanHeadline(item.title, sourceName),
+            url: item.link,
+            sourceName,
+            sourceDomain,
+            matchedKeyword: hit
+          };
+        }
+      }
+      return null;
+    };
+
+    try {
+      const feed = await this.fetchRssFeed(feedUrl);
+      const picked = pickFromItems(feed.items);
+      if (picked) return picked;
+
+      // If keywords were set and a small RSS feed had no match, query Google News
+      // scoped to this source domain + keywords (skip for direct JSON breaking feeds like Iran Monitor
+      // which already return 200 live breaking events and whose Google News index only lists static pages).
+      const isDirectJsonApi = /\/api\/events\b/i.test(feedUrl);
+      if (keywords.length > 0 && sourceDomain && !isDirectJsonApi) {
+        const kwExpr = keywords
+          .map((k) => (/\s/.test(k) ? `"${k}"` : k))
+          .join(' OR ');
+        const domainQuery = sourceDomain.replace(/^www\./, '');
+        const scopedUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(
+          `site:${domainQuery} (${kwExpr})`
+        )}&hl=en-US&gl=US&ceid=US:en`;
+        const scopedFeed = await this.fetchRssFeed(scopedUrl);
+        const scopedPick = pickFromItems(scopedFeed.items);
+        if (scopedPick) return scopedPick;
+      }
     } catch (e) {
       console.warn('News Fetch Failed', e);
+    }
+
+    if (keywords.length > 0) {
+      return {
+        title: `No headlines matching: ${keywords.join(', ')}`,
+        url: fallbackSiteUrl,
+        sourceName,
+        sourceDomain,
+        noKeywordMatch: true
+      };
     }
 
     if (fallbackSiteUrl) {

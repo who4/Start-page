@@ -50,6 +50,7 @@ export interface WeatherLocation {
 export interface NewsSettings {
   sourceId: string;
   customUrl: string;
+  keywords: string[];
 }
 
 export interface Settings {

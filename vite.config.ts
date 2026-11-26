@@ -3,9 +3,9 @@ import { crx, defineManifest } from '@crxjs/vite-plugin';
 
 const manifest = defineManifest({
   manifest_version: 3,
-  name: 'Start',
+  name: 'Solid',
   version: '1.1.0',
-  description: 'A modern, customizable new tab page with shortcuts and price ticker.',
+  description: 'A minimalist, customizable new tab page with shortcuts, live telemetry, and workspace modules.',
   permissions: ['storage', 'tabs', 'bookmarks', 'history', 'contextMenus', 'alarms', 'notifications', 'favicon'],
   host_permissions: [
     '*://*.google.com/*',
@@ -534,7 +534,7 @@ function attachPreviewMiddlewares(middlewares: {
         redirect: 'follow',
         headers: {
           'User-Agent': BROWSER_UA,
-          Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
+          Accept: 'application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
         },
         signal: AbortSignal.timeout(7000)
       })

@@ -151,7 +151,7 @@ const handlers: Record<string, Handler> = {
     fetch(url, {
       redirect: 'follow',
       headers: {
-        Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
+        Accept: 'application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
       }
     })
       .then(async (response) => {

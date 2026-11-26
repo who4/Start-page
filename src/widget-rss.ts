@@ -25,7 +25,7 @@ const CURATED_FEEDS: Array<{ title: string; url: string }> = [
   { title: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
   {
     title: 'Iran Monitor',
-    url: 'https://news.google.com/rss/search?q=site:iranmonitor.org&hl=en-US&gl=US&ceid=US:en'
+    url: 'https://www.iranmonitor.org/api/events'
   },
   { title: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
   { title: 'Hacker News', url: 'https://hnrss.org/frontpage' },

@@ -702,16 +702,32 @@ async function updateNews(): Promise<void> {
     settings.news?.sourceId === 'custom' && settings.news?.customUrl
       ? hostOfUrl(settings.news.customUrl)
       : getNewsSource(settings.news?.sourceId).name;
+  const activeKeywords = (settings.news?.keywords || []).filter((k) => k.trim().length > 0);
 
-  if (sourceMetaEl) sourceMetaEl.textContent = activeSource;
+  if (sourceMetaEl) {
+    sourceMetaEl.textContent =
+      activeKeywords.length > 0 ? `${activeSource} · ${activeKeywords.join(', ')}` : activeSource;
+  }
 
   const article = await ApiClient.fetchNews(settings.news);
   if (article) {
+    if (article.noKeywordMatch) {
+      headlineEl.textContent = article.title;
+      newsEl.removeAttribute('href');
+      newsEl.classList.add('news-widget--inert');
+      if (sourceMetaEl) {
+        sourceMetaEl.textContent = `${article.sourceName} · FILTERED`;
+      }
+      return;
+    }
+
     headlineEl.textContent = `"${article.title}"`;
     newsEl.href = article.url;
     newsEl.classList.remove('news-widget--inert');
     if (sourceMetaEl) {
-      sourceMetaEl.textContent = `${article.sourceName} · ${article.sourceDomain}`;
+      sourceMetaEl.textContent = article.matchedKeyword
+        ? `${article.sourceName} · #${article.matchedKeyword}`
+        : `${article.sourceName} · ${article.sourceDomain}`;
     }
   } else {
     headlineEl.textContent = t('noRecentNews');

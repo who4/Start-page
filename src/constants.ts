@@ -54,7 +54,7 @@ export const NEWS_SOURCES: NewsSourceDef[] = [
     id: 'iranmonitor',
     name: 'Iran Monitor',
     domain: 'www.iranmonitor.org',
-    feedUrl: 'https://news.google.com/rss/search?q=site:iranmonitor.org&hl=en-US&gl=US&ceid=US:en',
+    feedUrl: 'https://www.iranmonitor.org/api/events',
     siteUrl: 'https://www.iranmonitor.org'
   },
   {

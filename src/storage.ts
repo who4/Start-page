@@ -34,7 +34,8 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   news: {
     sourceId: 'bbc-world',
-    customUrl: ''
+    customUrl: '',
+    keywords: []
   },
   widgets: {
     priceTicker: true,

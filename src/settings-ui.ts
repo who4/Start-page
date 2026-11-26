@@ -264,7 +264,11 @@ export class SettingsUI {
       btn.title = src.domain;
       btn.addEventListener('click', () => {
         void this.update((s) => {
-          s.news = { sourceId: src.id, customUrl: s.news?.customUrl ?? '' };
+          s.news = {
+            sourceId: src.id,
+            customUrl: s.news?.customUrl ?? '',
+            keywords: s.news?.keywords ?? []
+          };
         });
         this.callbacks.onToast?.(`News source set to ${src.name} (${src.domain})`);
       });
@@ -279,7 +283,11 @@ export class SettingsUI {
     customNewsBtn.type = 'button';
     customNewsBtn.addEventListener('click', () =>
       void this.update((s) => {
-        s.news = { sourceId: 'custom', customUrl: s.news?.customUrl ?? '' };
+        s.news = {
+          sourceId: 'custom',
+          customUrl: s.news?.customUrl ?? '',
+          keywords: s.news?.keywords ?? []
+        };
       })
     );
     newsRow.appendChild(customNewsBtn);
@@ -301,7 +309,11 @@ export class SettingsUI {
         const val = customIn.value.trim();
         if (!val) return;
         void this.update((s) => {
-          s.news = { sourceId: 'custom', customUrl: val };
+          s.news = {
+            sourceId: 'custom',
+            customUrl: val,
+            keywords: s.news?.keywords ?? []
+          };
         });
         this.callbacks.onToast?.(`Custom news source set to ${val}`);
       });
@@ -319,6 +331,98 @@ export class SettingsUI {
         : `Active: ${activeNewsDef.name} (${activeNewsDef.domain})`
     );
     newsGroup.appendChild(newsMeta);
+
+    // News keyword filter (only show headlines containing at least one keyword)
+    const keywordGroup = el('div', 'form-group');
+    keywordGroup.appendChild(el('label', undefined, 'News keyword filter'));
+
+    const kwForm = el('form', 'news-custom-row');
+    const kwInput = el('input', 'hw-input-sm');
+    kwInput.type = 'text';
+    kwInput.placeholder = 'Add keyword (e.g. Iran, AI, protest) — comma-separated supported';
+
+    const kwAddBtn = el('button', 'hw-mini-btn is-accent', '+ Add');
+    kwAddBtn.type = 'submit';
+    kwForm.append(kwInput, kwAddBtn);
+
+    kwForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const parts = kwInput.value
+        .split(',')
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      if (parts.length === 0) return;
+
+      const existing = this.settings.news?.keywords ?? [];
+      const existingLower = new Set(existing.map((k) => k.toLowerCase()));
+      const additions = parts.filter((p) => !existingLower.has(p.toLowerCase()));
+      if (additions.length === 0) {
+        kwInput.value = '';
+        return;
+      }
+
+      void this.update((s) => {
+        s.news = {
+          sourceId: s.news?.sourceId || 'bbc-world',
+          customUrl: s.news?.customUrl ?? '',
+          keywords: [...(s.news?.keywords ?? []), ...additions]
+        };
+      });
+      this.callbacks.onToast?.(`Added keyword filter: ${additions.join(', ')}`);
+    });
+
+    keywordGroup.appendChild(kwForm);
+
+    const activeKeywords = this.settings.news?.keywords ?? [];
+    if (activeKeywords.length > 0) {
+      const chipList = el('div', 'keyword-chip-list');
+      for (const kw of activeKeywords) {
+        const chip = el('span', 'keyword-chip');
+        chip.appendChild(el('span', 'keyword-chip-text', kw));
+        const rmBtn = el('button', 'keyword-chip-rm', '×');
+        rmBtn.type = 'button';
+        rmBtn.setAttribute('aria-label', `Remove keyword ${kw}`);
+        rmBtn.addEventListener('click', () => {
+          void this.update((s) => {
+            s.news = {
+              sourceId: s.news?.sourceId || 'bbc-world',
+              customUrl: s.news?.customUrl ?? '',
+              keywords: (s.news?.keywords ?? []).filter((k) => k !== kw)
+            };
+          });
+        });
+        chip.appendChild(rmBtn);
+        chipList.appendChild(chip);
+      }
+
+      if (activeKeywords.length > 1) {
+        const clearBtn = el('button', 'hw-link-btn keyword-clear-btn', 'Clear all');
+        clearBtn.type = 'button';
+        clearBtn.addEventListener('click', () => {
+          void this.update((s) => {
+            s.news = {
+              sourceId: s.news?.sourceId || 'bbc-world',
+              customUrl: s.news?.customUrl ?? '',
+              keywords: []
+            };
+          });
+          this.callbacks.onToast?.('Cleared all news keyword filters');
+        });
+        chipList.appendChild(clearBtn);
+      }
+
+      keywordGroup.appendChild(chipList);
+    }
+
+    keywordGroup.appendChild(
+      el(
+        'div',
+        'settings-note',
+        activeKeywords.length > 0
+          ? 'Live Wire will only display stories containing one of these keywords.'
+          : 'Leave empty to show the latest headline from your selected source.'
+      )
+    );
 
     const calGroup = this.buildSegGroup(
       t('calendar'),
@@ -385,6 +489,7 @@ export class SettingsUI {
       weatherGroup,
       unitGroup,
       newsGroup,
+      keywordGroup,
       calGroup,
       clockGroup,
       secondsToggle,

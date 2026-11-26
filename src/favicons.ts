@@ -291,7 +291,8 @@ function loadImage(src: string): Promise<HTMLImageElement | null> {
 }
 
 // Compute a razor-clean perceptual density & crisp edge alpha field (0..1).
-// Eliminates anti-aliased fringe dirt and cleanly separates badge knockouts & white boxes.
+// Eliminates anti-aliased fringe dirt and cleanly preserves inner white/dark cutouts
+// such as YouTube's white play triangle, Reddit's Snoo, LinkedIn's "in", and Spotify's waves.
 function buildCleanInkField(src: Uint8ClampedArray, size: number): {
   density: Float32Array;
   edgeAlpha: Float32Array;
@@ -299,6 +300,7 @@ function buildCleanInkField(src: Uint8ClampedArray, size: number): {
   const n = size * size;
   const lumArr = new Float32Array(n);
   const satArr = new Float32Array(n);
+  const whiteArr = new Float32Array(n); // min(r,g,b)/255 — near 0 for vivid brand colors, ~1 for white glyphs
   const alphaArr = new Float32Array(n);
 
   let opaqueCount = 0;
@@ -320,17 +322,19 @@ function buildCleanInkField(src: Uint8ClampedArray, size: number): {
     const b = src[p + 2];
     const [, s, l] = rgbToHsl(r, g, b);
     const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    const whiteness = Math.min(r, g, b) / 255;
     lumArr[i] = lum;
     satArr[i] = s;
+    whiteArr[i] = whiteness;
 
     if (a > 0.45) {
       opaqueCount++;
       lumSum += lum;
       if (lum < minLum) minLum = lum;
       if (lum > maxLum) maxLum = lum;
-      if (s >= 0.18 && l >= 0.12 && l <= 0.90) chromaticCount++;
-      if (s < 0.14 && lum > 0.85) whiteCount++;
-      if (lum < 0.15) veryDarkCount++;
+      if (s >= 0.18 && l >= 0.12 && l <= 0.90 && whiteness < 0.55) chromaticCount++;
+      if (whiteness > 0.68 && lum > 0.78) whiteCount++;
+      if (lum < 0.16) veryDarkCount++;
     }
   }
 
@@ -347,7 +351,7 @@ function buildCleanInkField(src: Uint8ClampedArray, size: number): {
   for (const idx of corners) {
     if (alphaArr[idx] > 0.72) {
       opaqueCorners++;
-      if (satArr[idx] < 0.14 && lumArr[idx] > 0.85) whiteCorners++;
+      if (whiteArr[idx] > 0.78 && lumArr[idx] > 0.84) whiteCorners++;
     }
   }
 
@@ -358,10 +362,15 @@ function buildCleanInkField(src: Uint8ClampedArray, size: number): {
   const lumRange = Math.max(0.20, maxLum - minLum);
 
   const hasWhiteCardBg = whiteCorners >= 3 && opaqueCorners >= 3;
+  // Catch even small inner white glyphs like YouTube's play triangle (~1.5-5% of icon area)
   const isColoredBadgeWithWhiteGlyph =
-    !hasWhiteCardBg && chromaticFrac > 0.30 && whiteFrac > 0.03 && whiteFrac < 0.54;
+    !hasWhiteCardBg && chromaticFrac > 0.28 && whiteFrac > 0.008 && whiteFrac < 0.58;
   const isColoredBadgeWithDarkGlyph =
-    !hasWhiteCardBg && !isColoredBadgeWithWhiteGlyph && chromaticFrac > 0.35 && darkFrac > 0.04 && darkFrac < 0.45;
+    !hasWhiteCardBg &&
+    !isColoredBadgeWithWhiteGlyph &&
+    chromaticFrac > 0.35 &&
+    darkFrac > 0.02 &&
+    darkFrac < 0.48;
   const isDarkSilhouette =
     !hasWhiteCardBg && opaqueCorners <= 2 && chromaticFrac < 0.18 && avgLum < 0.38;
 
@@ -374,45 +383,54 @@ function buildCleanInkField(src: Uint8ClampedArray, size: number): {
 
     const lum = lumArr[i];
     const sat = satArr[i];
+    const whiteness = whiteArr[i];
     let d = 0;
     let ea = a;
 
     if (hasWhiteCardBg) {
       // Cleanly drop white outer card so only the emblem renders
-      const whiteness = (1 - sat) * lum;
-      if (whiteness > 0.84) continue;
+      if (whiteness > 0.78 && lum > 0.84) continue;
       const strength = Math.min(1, ((1 - lum) * 1.15 + sat * 0.75) * 1.25);
       d = 0.45 + 0.55 * strength;
-      ea = Math.min(1, a * Math.min(1, (0.88 - whiteness) * 6));
+      ea = Math.min(1, a * Math.min(1, (0.86 - whiteness) * 5));
     } else if (isColoredBadgeWithWhiteGlyph) {
-      // YouTube, Reddit, LinkedIn, etc. — solid clean badge + zero-speckle knockout glyph
-      const isWhiteGlyph = sat < 0.18 && lum > 0.76;
-      if (isWhiteGlyph) {
+      // YouTube, Reddit, LinkedIn, etc. — crisp colored badge + razor-sharp negative-space glyph cutout
+      if (whiteness > 0.44) {
         d = 0;
         ea = 0;
+      } else if (whiteness > 0.24) {
+        // Smooth anti-aliased transition right along the triangle/glyph edge
+        const t = (0.44 - whiteness) / 0.20;
+        d = 0.76 * t;
+        ea = a * t;
       } else {
-        d = 0.80 + 0.18 * Math.min(1, sat + (1 - Math.abs(lum - 0.5)) * 0.5);
+        d = 0.74 + 0.14 * Math.min(1, sat);
       }
     } else if (isColoredBadgeWithDarkGlyph) {
-      // Spotify, etc. — solid clean badge + crisp dark-wave knockout
-      if (lum < 0.22 && sat < 0.24) {
+      // Spotify, etc. — crisp colored badge + sharp dark-wave cutout
+      if (lum < 0.24 && sat < 0.26) {
         d = 0;
         ea = 0;
       } else {
-        d = 0.82 + 0.16 * Math.min(1, sat);
+        d = 0.76 + 0.14 * Math.min(1, sat);
       }
     } else if (isDarkSilhouette) {
-      // GitHub, X, Notion, Apple — solid clean silhouette
-      d = 0.82 + 0.18 * (1 - lum);
+      // GitHub, X, Notion, Apple — crisp solid silhouette
+      d = 0.78 + 0.16 * (1 - lum);
     } else {
       // Gmail, Google, Wikipedia globe, Figma, Slack
       const stretched = (lum - minLum) / lumRange;
       if (chromaticFrac < 0.15) {
         // Monochrome detailed emblem (e.g., Wikipedia globe): clear highlight vs ink contrast
-        d = 0.18 + 0.80 * stretched;
+        d = 0.16 + 0.78 * stretched;
       } else {
-        // Multicolored emblem on transparent: strong, clean, readable presence
-        d = 0.68 + 0.30 * (0.45 * stretched + 0.55 * sat);
+        // Multicolored emblem on transparent: also knock out pure white interior highlights
+        if (whiteness > 0.72 && lum > 0.82) {
+          d = 0;
+          ea = 0;
+        } else {
+          d = 0.66 + 0.24 * (0.45 * stretched + 0.55 * sat);
+        }
       }
     }
 
@@ -476,7 +494,7 @@ function renderProcessedIcon(
       if (ea < 0.08) continue;
       const d = density[i];
       if (d < 0.06) continue;
-      const alpha = Math.min(1, ea * (0.28 + 0.72 * d));
+      const alpha = Math.min(1, ea * (0.32 + 0.68 * d));
       const p = i * 4;
       dst[p] = cr;
       dst[p + 1] = cg;
@@ -488,30 +506,29 @@ function renderProcessedIcon(
   }
 
   // 'dithered' & 'monochrome':
-  // Crisp structured 4x4 Bayer ordered halftone on 2x2 Retina cells (= clean 1px CSS dots).
-  // Zero random noise speckles, zero perimeter fringe dirt, crisp silhouette preservation.
+  // Fine 1px physical-pixel 4x4 Bayer ordered halftone at 2x Retina (44x44 -> 22x22 CSS).
+  // Eliminates chunky polka-dot grids while keeping crisp silhouettes and inner cutouts.
   for (let y = 0; y < size; y++) {
-    const by = (y >> 1) & 3;
+    const by = y & 3;
     for (let x = 0; x < size; x++) {
       const i = y * size + x;
       const ea = edgeAlpha[i];
-      if (ea < 0.44) continue; // Strict edge gate removes blurry fringe specks
+      if (ea < 0.40) continue;
 
       const d = density[i];
       if (d <= 0.05) continue;
 
-      const bx = (x >> 1) & 3;
+      const bx = x & 3;
       const threshold = BAYER_4X4[by][bx];
-      // Boost mid-high densities slightly so solid brand marks stay crisp and unmistakable
-      const tone = Math.min(0.96, d * 1.04);
+      // Calibrated micro-halftone range: fine uniform texture without chunky holes
+      const tone = Math.min(0.86, d * 0.94);
 
       if (tone > threshold) {
         const p = i * 4;
         dst[p] = cr;
         dst[p + 1] = cg;
         dst[p + 2] = cb;
-        // Soften only the outermost anti-aliased edge pixel for clean optical smoothness
-        dst[p + 3] = Math.round(Math.min(1, (ea - 0.35) / 0.55) * 255);
+        dst[p + 3] = Math.round(Math.min(1, (ea - 0.30) / 0.55) * 255);
       }
     }
   }
