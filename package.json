@@ -1,0 +1,35 @@
+{
+  "name": "chrome-extension",
+  "version": "1.0.1",
+  "description": "",
+  "main": "api.js",
+  "scripts": {
+    "build": "vite build",
+    "build:ext": "vite build --mode extension",
+    "dev": "vite --host 0.0.0.0 --port 3000",
+    "preview": "vite preview --host 0.0.0.0 --port 3000",
+    "watch": "vite build --watch --mode extension",
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/who4/Home-Extension-Chrome.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/who4/Home-Extension-Chrome/issues"
+  },
+  "homepage": "https://github.com/who4/Home-Extension-Chrome#readme",
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.7.1",
+    "@types/chrome": "^0.2.7",
+    "happy-dom": "^20.11.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}
