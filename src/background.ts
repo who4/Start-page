@@ -2,16 +2,13 @@ import type {
   BackgroundRequest,
   BackgroundResponse,
   ErrorResponse,
+  FetchRssRequest,
   FetchSuggestionsRequest,
+  GetFaviconRequest,
   ProxyFetchRequest,
   SuccessResponse
 } from './types';
 import { FINANCE_ASSETS } from './constants';
-
-interface GetFaviconRequest {
-  action: 'GET_FAVICON';
-  domain: string;
-}
 
 type Handler = (
   request: never, // narrowed by registry wrapper below
@@ -21,6 +18,58 @@ type Handler = (
 // Only the newest suggestion request's response is delivered; stale fetches
 // still complete but their results are discarded.
 let suggestionGeneration = 0;
+
+function extractFirstIconFromHtml(html: string, baseUrl: string): string[] {
+  const head = html.match(/<head[\s\S]*?<\/head>/i)?.[0] ?? html.slice(0, 24000);
+  const tags = head.match(/<link\b[^>]*>/gi) || [];
+  const scored: Array<{ url: string; score: number }> = [];
+
+  for (const tag of tags) {
+    const relM = tag.match(/\brel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    const hrefM = tag.match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    if (!relM || !hrefM) continue;
+    const rel = (relM[1] || relM[2] || relM[3] || '').toLowerCase();
+    const rawHref = (hrefM[1] || hrefM[2] || hrefM[3] || '').trim();
+    if (!rawHref || rawHref.startsWith('data:')) continue;
+    if (!/\b(icon|apple-touch-icon|fluid-icon|shortcut)\b/.test(rel) || rel.includes('mask-icon')) continue;
+    try {
+      const resolved = new URL(rawHref, baseUrl).toString();
+      const score =
+        /\.svg(\?|$)/i.test(resolved) || /svg/i.test(tag)
+          ? 100
+          : rel.includes('apple-touch-icon')
+            ? 82
+            : /\.png(\?|$)/i.test(resolved)
+              ? 76
+              : 50;
+      scored.push({ url: resolved, score });
+    } catch {
+      // ignore invalid href
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return Array.from(new Set(scored.map((s) => s.url))).slice(0, 4);
+}
+
+async function fetchImageAsDataUrl(url: string): Promise<string | null> {
+  try {
+    const resp = await fetch(url, { redirect: 'follow' });
+    if (!resp.ok) return null;
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    const blob = await resp.blob();
+    if (blob.size < 60 || blob.size > 1_500_000) return null;
+    if (ct.includes('text/html')) return null;
+    return await new Promise<string | null>((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+}
 
 const handlers: Record<string, Handler> = {
   FETCH_SUGGESTIONS: (request: unknown, sendResponse) => {
@@ -47,7 +96,18 @@ const handlers: Record<string, Handler> = {
     const { url } = request as ProxyFetchRequest;
 
     // URL allowlist — only allow hostnames matching host_permissions in manifest
-    const ALLOWED_HOSTS = ['google.com', 'tgju.org', 'brsapi.ir', 'rss2json.com'];
+    const ALLOWED_HOSTS = [
+      'google.com',
+      'tgju.org',
+      'brsapi.ir',
+      'rss2json.com',
+      'bbci.co.uk',
+      'aljazeera.com',
+      'hnrss.org',
+      'theverge.com',
+      'arstechnica.com',
+      'iranmonitor.org'
+    ];
     try {
       const hostname = new URL(url).hostname;
       const allowed = ALLOWED_HOSTS.some(
@@ -75,28 +135,82 @@ const handlers: Record<string, Handler> = {
       });
   },
 
-  GET_FAVICON: (request: unknown, sendResponse) => {
-    const { domain } = request as GetFaviconRequest;
-    const faviconUrl = `https://www.google.com/s2/favicons?sz=64&domain_url=${encodeURIComponent(domain)}`;
+  FETCH_RSS: (request: unknown, sendResponse) => {
+    const { url } = request as FetchRssRequest;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        sendResponse({ success: false, error: 'Invalid RSS URL' } as ErrorResponse);
+        return;
+      }
+    } catch {
+      sendResponse({ success: false, error: 'Invalid RSS URL' } as ErrorResponse);
+      return;
+    }
 
-    fetch(faviconUrl)
+    fetch(url, {
+      redirect: 'follow',
+      headers: {
+        Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
+      }
+    })
       .then(async (response) => {
         if (!response.ok) throw new Error(response.statusText);
-        const blob = await response.blob();
-        // Convert to dataURL via FileReader in SW
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result as string);
-          reader.onerror = () => reject(new Error('read failed'));
-          reader.readAsDataURL(blob);
-        });
-        const res: SuccessResponse<string> = { success: true, data: dataUrl };
-        sendResponse(res);
+        const text = await response.text();
+        sendResponse({ success: true, data: text } as SuccessResponse<string>);
       })
       .catch((error: Error) => {
-        const res: ErrorResponse = { success: false, error: error.message };
-        sendResponse(res);
+        sendResponse({ success: false, error: error.message } as ErrorResponse);
       });
+  },
+
+  GET_FAVICON: (request: unknown, sendResponse) => {
+    const { domain } = request as GetFaviconRequest;
+    const clean = (domain || '').trim().toLowerCase();
+
+    (async () => {
+      // 1. Direct HTML icon discovery from the website itself
+      try {
+        const pageResp = await fetch(`https://${clean}/`, { redirect: 'follow' });
+        if (pageResp.ok) {
+          const finalHost = new URL(pageResp.url).hostname.replace(/^www\./, '').toLowerCase();
+          const baseHost = clean.replace(/^www\./, '').toLowerCase();
+          const isAuthRedirect = /^(accounts|login|signin|auth)\./.test(finalHost) && finalHost !== baseHost;
+          if (!isAuthRedirect) {
+            const html = (await pageResp.text()).slice(0, 60000);
+            const links = extractFirstIconFromHtml(html, pageResp.url);
+            for (const link of links) {
+              const dataUrl = await fetchImageAsDataUrl(link);
+              if (dataUrl) {
+                sendResponse({ success: true, data: dataUrl } as SuccessResponse<string>);
+                return;
+              }
+            }
+          }
+        }
+      } catch {
+        // continue to direct paths & fallbacks
+      }
+
+      // 2. Direct paths + fallback providers
+      const candidates = [
+        `https://${clean}/favicon.svg`,
+        `https://${clean}/apple-touch-icon.png`,
+        `https://${clean}/favicon.ico`,
+        `https://icons.duckduckgo.com/ip3/${encodeURIComponent(clean)}.ico`,
+        `https://www.google.com/s2/favicons?sz=128&domain=${encodeURIComponent(clean)}`
+      ];
+
+      for (const candidate of candidates) {
+        const dataUrl = await fetchImageAsDataUrl(candidate);
+        if (dataUrl) {
+          sendResponse({ success: true, data: dataUrl } as SuccessResponse<string>);
+          return;
+        }
+      }
+
+      sendResponse({ success: false, error: 'Favicon unavailable' } as ErrorResponse);
+    })();
   }
 };
 

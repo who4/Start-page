@@ -87,6 +87,7 @@ export function applyTheme(settings: Settings): void {
   root.dataset.colorScheme = preset.mode;
   root.dataset.clockScale = settings.appearance.clockScale || 'standard';
   root.dataset.density = settings.appearance.density || 'standard';
+  root.dataset.scrollbar = settings.appearance.scrollbarStyle || 'thin';
   delete root.dataset.surfaceGrid;
 
   if (settings.general.showDailyFocus === false) {

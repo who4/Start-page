@@ -35,7 +35,8 @@ export interface PriceAlert {
 export type TempUnit = 'c' | 'f';
 export type ClockScale = 'compact' | 'standard' | 'large';
 export type LayoutDensity = 'compact' | 'standard' | 'spacious';
-export type BookmarkIconStyle = 'dithered' | 'grain' | 'monochrome' | 'off';
+export type BookmarkIconStyle = 'dithered' | 'solid' | 'original' | 'monochrome' | 'off';
+export type ScrollbarStyle = 'thin' | 'accent' | 'hidden';
 
 export interface WeatherLocation {
   city: string;
@@ -44,6 +45,11 @@ export interface WeatherLocation {
   lon: number;
   useGeolocation: boolean;
   unit?: TempUnit;
+}
+
+export interface NewsSettings {
+  sourceId: string;
+  customUrl: string;
 }
 
 export interface Settings {
@@ -55,6 +61,7 @@ export interface Settings {
     clockScale: ClockScale;
     density: LayoutDensity;
     bookmarkIconStyle: BookmarkIconStyle;
+    scrollbarStyle: ScrollbarStyle;
     showBookmarkHosts: boolean;
     showBookmarkIndices: boolean;
     surfaceGrid: boolean;
@@ -69,6 +76,7 @@ export interface Settings {
     rememberDrawerState: boolean;
   };
   weather: WeatherLocation;
+  news: NewsSettings;
   widgets: {
     priceTicker: boolean;
     newsWidget: boolean;
@@ -122,7 +130,21 @@ export interface ProxyFetchRequest {
   url: string;
 }
 
-export type BackgroundRequest = FetchSuggestionsRequest | ProxyFetchRequest;
+export interface FetchRssRequest {
+  action: 'FETCH_RSS';
+  url: string;
+}
+
+export interface GetFaviconRequest {
+  action: 'GET_FAVICON';
+  domain: string;
+}
+
+export type BackgroundRequest =
+  | FetchSuggestionsRequest
+  | ProxyFetchRequest
+  | FetchRssRequest
+  | GetFaviconRequest;
 
 export interface SuccessResponse<T = unknown> {
   success: true;

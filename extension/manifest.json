@@ -10,20 +10,28 @@
     "history",
     "contextMenus",
     "alarms",
-    "notifications"
+    "notifications",
+    "favicon"
   ],
   "host_permissions": [
     "*://*.google.com/*",
     "*://*.tgju.org/*",
     "*://brsapi.ir/*",
     "*://api.rss2json.com/*",
+    "*://feeds.bbci.co.uk/*",
+    "*://www.aljazeera.com/*",
+    "*://hnrss.org/*",
+    "*://www.theverge.com/*",
+    "*://feeds.arstechnica.com/*",
+    "*://*.iranmonitor.org/*",
     "*://api.open-meteo.com/*",
     "*://air-quality-api.open-meteo.com/*",
     "*://geocoding-api.open-meteo.com/*",
     "*://photon.komoot.io/*",
     "*://nominatim.openstreetmap.org/*",
     "*://icons.duckduckgo.com/*",
-    "*://*.gstatic.com/*"
+    "*://*.gstatic.com/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "service-worker-loader.js",

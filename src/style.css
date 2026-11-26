@@ -293,6 +293,59 @@ kbd {
 }
 
 /* ==========================================================================
+   CUSTOM THEME-AWARE SCROLLBARS (PAGE-WIDE & SETTINGS-CONFIGURABLE)
+   ========================================================================== */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 0;
+  transition: background-color 140ms var(--ease-tactile);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+[data-scrollbar="accent"] * {
+  scrollbar-color: var(--accent-border) transparent;
+}
+
+[data-scrollbar="accent"] *::-webkit-scrollbar-thumb {
+  background: var(--accent-border);
+}
+
+[data-scrollbar="accent"] *::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+[data-scrollbar="hidden"] * {
+  scrollbar-width: none;
+}
+
+[data-scrollbar="hidden"] *::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ==========================================================================
    THREE-PANE SYSTEM TERMINAL SHELL (VARIATION 6)
    ========================================================================== */
 
@@ -433,8 +486,7 @@ kbd {
   width: 22px;
   height: 22px;
   display: block;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
+  image-rendering: auto;
 }
 
 .shortcut-label-wrap {
@@ -715,9 +767,11 @@ kbd {
 /* Suggestions Sheet */
 .suggestions-container {
   position: absolute;
-  top: calc(100% + 8px);
+  top: calc(100% + 6px);
   left: 0;
   right: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
@@ -736,15 +790,16 @@ kbd {
 }
 
 .suggestions-list {
-  max-height: 320px;
+  max-height: 220px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .suggestion-item {
-  padding: 10px 14px;
+  padding: 8px 12px;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   cursor: pointer;
   border-bottom: 1px solid var(--border-hairline);
   color: var(--text-secondary);
@@ -966,6 +1021,16 @@ kbd {
 
 .news-wire-link:hover .news-p {
   color: var(--text-primary);
+}
+
+.news-source-meta {
+  display: block;
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
 }
 
 .news-widget--inert {
@@ -2558,6 +2623,23 @@ kbd {
   font-size: 12px;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+.news-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.news-custom-row .hw-input-sm {
+  flex: 1;
+  height: 32px;
+}
+
+.news-custom-row .hw-mini-btn {
+  height: 32px;
+  padding: 0 12px;
 }
 
 /* Custom Bangs Manager */

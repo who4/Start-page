@@ -2,7 +2,7 @@ import './chrome-shim';
 import { ApiClient } from './api';
 import { attachPasteCapture, getEmptyStateResults } from './chrome-providers';
 import { ActionRegistry, CommandBarEngine, type BarResult } from './commandbar';
-import { hostOfUrl, INTERVALS, SUGGESTIONS } from './constants';
+import { getNewsSource, hostOfUrl, INTERVALS, SUGGESTIONS } from './constants';
 import { createFaviconElement } from './favicons';
 import { BentoGrid, registry } from './grid';
 import { t } from './i18n';
@@ -256,7 +256,26 @@ function renderBarResults(results: BarResult[]): void {
   fragment.append(listWrap, footer);
   suggestionsEl.replaceChildren(fragment);
   suggestionsEl.classList.add('visible');
+  clampSuggestionsHeight();
+
+  const activeEl = listWrap.querySelector<HTMLElement>('.suggestion-item.highlighted');
+  activeEl?.scrollIntoView({ block: 'nearest' });
 }
+
+function clampSuggestionsHeight(): void {
+  if (!suggestionsEl || !suggestionsEl.classList.contains('visible')) return;
+  const listWrap = suggestionsEl.querySelector<HTMLElement>('.suggestions-list');
+  const slot = searchInput?.closest('.command-slot');
+  if (!listWrap || !slot) return;
+  const rect = slot.getBoundingClientRect();
+  // Keep dropdown cleanly above the bottom edge of the viewport (with margin for bottom controls)
+  const availableBelow = window.innerHeight - rect.bottom - 20;
+  const footerHeight = suggestionsEl.querySelector<HTMLElement>('.suggestions-footer')?.offsetHeight || 30;
+  const maxListHeight = Math.max(96, Math.min(230, availableBelow - footerHeight - 12));
+  listWrap.style.maxHeight = `${Math.floor(maxListHeight)}px`;
+}
+
+window.addEventListener('resize', clampSuggestionsHeight);
 
 function clearBar(): void {
   suggestionsEl?.replaceChildren();
@@ -676,13 +695,24 @@ async function updatePrices(): Promise<void> {
 async function updateNews(): Promise<void> {
   const newsEl = document.getElementById('news-widget') as HTMLAnchorElement | null;
   const headlineEl = document.getElementById('news-headline');
+  const sourceMetaEl = document.getElementById('news-source-meta');
   if (!newsEl || !headlineEl || !settings?.widgets.newsWidget) return;
 
-  const article = await ApiClient.fetchNews();
+  const activeSource =
+    settings.news?.sourceId === 'custom' && settings.news?.customUrl
+      ? hostOfUrl(settings.news.customUrl)
+      : getNewsSource(settings.news?.sourceId).name;
+
+  if (sourceMetaEl) sourceMetaEl.textContent = activeSource;
+
+  const article = await ApiClient.fetchNews(settings.news);
   if (article) {
     headlineEl.textContent = `"${article.title}"`;
     newsEl.href = article.url;
     newsEl.classList.remove('news-widget--inert');
+    if (sourceMetaEl) {
+      sourceMetaEl.textContent = `${article.sourceName} · ${article.sourceDomain}`;
+    }
   } else {
     headlineEl.textContent = t('noRecentNews');
     newsEl.removeAttribute('href');

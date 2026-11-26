@@ -1,6 +1,6 @@
 import { clearClipboardHistory } from './chrome-providers';
 import { BUILT_IN_BANGS, deleteCustomBang, getCustomBangs, saveCustomBang } from './commandbar';
-import { FINANCE_ASSETS, type FinanceAssetId } from './constants';
+import { FINANCE_ASSETS, getNewsSource, NEWS_SOURCES, type FinanceAssetId } from './constants';
 import { isWidgetEnabled, registry, setWidgetEnabled } from './grid';
 import { t } from './i18n';
 import { DEFAULT_SETTINGS, storage } from './storage';
@@ -10,6 +10,7 @@ import type {
   BookmarkIconStyle,
   ClockScale,
   LayoutDensity,
+  ScrollbarStyle,
   Settings,
   TempUnit
 } from './types';
@@ -39,7 +40,7 @@ interface Section {
 }
 
 const SECTIONS: Section[] = [
-  { id: 'general', label: 'General & Weather' },
+  { id: 'general', label: 'General & Feeds' },
   { id: 'appearance', label: 'Themes & Layout' },
   { id: 'modules', label: 'Widgets & Modules' },
   { id: 'commands', label: 'Commands & Bangs' },
@@ -247,6 +248,78 @@ export class SettingsUI {
         })
     );
 
+    // Live Wire News Source selector (includes www.iranmonitor.org + custom RSS/site)
+    const newsGroup = el('div', 'form-group');
+    newsGroup.appendChild(el('label', undefined, 'News source (Live Wire)'));
+    const activeSourceId = this.settings.news?.sourceId || 'bbc-world';
+
+    const newsRow = el('div', 'seg-row');
+    for (const src of NEWS_SOURCES) {
+      const btn = el(
+        'button',
+        'seg-btn' + (activeSourceId === src.id ? ' active' : ''),
+        src.name
+      );
+      btn.type = 'button';
+      btn.title = src.domain;
+      btn.addEventListener('click', () => {
+        void this.update((s) => {
+          s.news = { sourceId: src.id, customUrl: s.news?.customUrl ?? '' };
+        });
+        this.callbacks.onToast?.(`News source set to ${src.name} (${src.domain})`);
+      });
+      newsRow.appendChild(btn);
+    }
+
+    const customNewsBtn = el(
+      'button',
+      'seg-btn' + (activeSourceId === 'custom' ? ' active' : ''),
+      'Custom URL'
+    );
+    customNewsBtn.type = 'button';
+    customNewsBtn.addEventListener('click', () =>
+      void this.update((s) => {
+        s.news = { sourceId: 'custom', customUrl: s.news?.customUrl ?? '' };
+      })
+    );
+    newsRow.appendChild(customNewsBtn);
+    newsGroup.appendChild(newsRow);
+
+    if (activeSourceId === 'custom') {
+      const customForm = el('form', 'news-custom-row');
+      const customIn = el('input', 'hw-input-sm');
+      customIn.type = 'text';
+      customIn.placeholder = 'https://www.iranmonitor.org or RSS feed URL...';
+      customIn.value = this.settings.news?.customUrl ?? '';
+
+      const applyBtn = el('button', 'hw-mini-btn is-accent', 'Apply');
+      applyBtn.type = 'submit';
+      customForm.append(customIn, applyBtn);
+
+      customForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const val = customIn.value.trim();
+        if (!val) return;
+        void this.update((s) => {
+          s.news = { sourceId: 'custom', customUrl: val };
+        });
+        this.callbacks.onToast?.(`Custom news source set to ${val}`);
+      });
+      newsGroup.appendChild(customForm);
+    }
+
+    const activeNewsDef = getNewsSource(activeSourceId);
+    const newsMeta = el(
+      'div',
+      'settings-note',
+      activeSourceId === 'custom'
+        ? this.settings.news?.customUrl
+          ? `Active custom source: ${this.settings.news.customUrl}`
+          : 'Enter any RSS/Atom URL or website domain above.'
+        : `Active: ${activeNewsDef.name} (${activeNewsDef.domain})`
+    );
+    newsGroup.appendChild(newsMeta);
+
     const calGroup = this.buildSegGroup(
       t('calendar'),
       this.settings.general.calendar,
@@ -311,6 +384,7 @@ export class SettingsUI {
     this.contentArea.append(
       weatherGroup,
       unitGroup,
+      newsGroup,
       calGroup,
       clockGroup,
       secondsToggle,
@@ -448,19 +522,35 @@ export class SettingsUI {
         })
     );
 
-    // Bookmark icon dither & grain mode
+    // Bookmark icon style
     const iconGroup = this.buildSegGroup<BookmarkIconStyle>(
       'Bookmark favicons',
       this.settings.appearance.bookmarkIconStyle || 'dithered',
       [
         ['dithered', 'Dithered'],
-        ['grain', 'Noisy Grain'],
+        ['solid', 'Solid Tint'],
+        ['original', 'Original'],
         ['monochrome', 'Mono Dither'],
         ['off', 'Hidden']
       ],
       (style) =>
         void this.update((s) => {
           s.appearance.bookmarkIconStyle = style;
+        })
+    );
+
+    // Custom scrollbar appearance
+    const scrollbarGroup = this.buildSegGroup<ScrollbarStyle>(
+      'Scrollbar style',
+      this.settings.appearance.scrollbarStyle || 'thin',
+      [
+        ['thin', 'Minimal Thin'],
+        ['accent', 'Accent Tint'],
+        ['hidden', 'Hidden']
+      ],
+      (style) =>
+        void this.update((s) => {
+          s.appearance.scrollbarStyle = style;
         })
     );
 
@@ -489,6 +579,7 @@ export class SettingsUI {
       clockScaleGroup,
       densityGroup,
       iconGroup,
+      scrollbarGroup,
       hostsToggle,
       indicesToggle
     );

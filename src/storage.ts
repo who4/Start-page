@@ -10,6 +10,7 @@ export const DEFAULT_SETTINGS: Settings = {
     clockScale: 'standard',
     density: 'standard',
     bookmarkIconStyle: 'dithered',
+    scrollbarStyle: 'thin',
     showBookmarkHosts: true,
     showBookmarkIndices: true,
     surfaceGrid: false,
@@ -30,6 +31,10 @@ export const DEFAULT_SETTINGS: Settings = {
     lon: 51.3890,
     useGeolocation: false,
     unit: 'c'
+  },
+  news: {
+    sourceId: 'bbc-world',
+    customUrl: ''
   },
   widgets: {
     priceTicker: true,
@@ -163,9 +168,12 @@ class StorageService {
   async getSettings(): Promise<Settings> {
     const raw = await this.get<unknown>(STORAGE_KEYS.settings);
     const merged = mergeWithDefaults(DEFAULT_SETTINGS, raw);
-    // Migrate legacy 'midnight' preset name to 'graphite'
+    // Migrate legacy preset/icon values
     if ((merged.appearance.themePreset as string) === 'midnight') {
       merged.appearance.themePreset = 'graphite';
+    }
+    if ((merged.appearance.bookmarkIconStyle as string) === 'grain') {
+      merged.appearance.bookmarkIconStyle = 'solid';
     }
     return merged;
   }

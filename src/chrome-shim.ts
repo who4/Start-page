@@ -156,6 +156,19 @@ function installChromeShim(): void {
       }
     }
 
+    if (message?.action === 'FETCH_RSS' && typeof message.url === 'string') {
+      try {
+        const resp = await fetch(`/api/rss?url=${encodeURIComponent(message.url)}`);
+        if (!resp.ok) {
+          return { success: false, error: `HTTP ${resp.status}` };
+        }
+        const data = await resp.text();
+        return { success: true, data };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : 'RSS fetch failed' };
+      }
+    }
+
     if (message?.action === 'FETCH_SUGGESTIONS' && typeof message.query === 'string') {
       try {
         const resp = await fetch(`/api/suggestions?q=${encodeURIComponent(message.query)}`);

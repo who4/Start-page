@@ -34,6 +34,70 @@ export const API_URLS = {
   newsConverter: 'https://api.rss2json.com/v1/api.json'
 } as const;
 
+export interface NewsSourceDef {
+  id: string;
+  name: string;
+  domain: string;
+  feedUrl: string;
+  siteUrl: string;
+}
+
+export const NEWS_SOURCES: NewsSourceDef[] = [
+  {
+    id: 'bbc-world',
+    name: 'BBC World',
+    domain: 'bbc.com',
+    feedUrl: 'https://feeds.bbci.co.uk/news/world/rss.xml',
+    siteUrl: 'https://www.bbc.com/news/world'
+  },
+  {
+    id: 'iranmonitor',
+    name: 'Iran Monitor',
+    domain: 'www.iranmonitor.org',
+    feedUrl: 'https://news.google.com/rss/search?q=site:iranmonitor.org&hl=en-US&gl=US&ceid=US:en',
+    siteUrl: 'https://www.iranmonitor.org'
+  },
+  {
+    id: 'reuters',
+    name: 'Reuters',
+    domain: 'reuters.com',
+    feedUrl: 'https://news.google.com/rss/search?q=site:reuters.com+world&hl=en-US&gl=US&ceid=US:en',
+    siteUrl: 'https://www.reuters.com/world/'
+  },
+  {
+    id: 'aljazeera',
+    name: 'Al Jazeera',
+    domain: 'aljazeera.com',
+    feedUrl: 'https://www.aljazeera.com/xml/rss/all.xml',
+    siteUrl: 'https://www.aljazeera.com'
+  },
+  {
+    id: 'hackernews',
+    name: 'Hacker News',
+    domain: 'news.ycombinator.com',
+    feedUrl: 'https://hnrss.org/frontpage',
+    siteUrl: 'https://news.ycombinator.com'
+  },
+  {
+    id: 'theverge',
+    name: 'The Verge',
+    domain: 'theverge.com',
+    feedUrl: 'https://www.theverge.com/rss/index.xml',
+    siteUrl: 'https://www.theverge.com'
+  },
+  {
+    id: 'arstechnica',
+    name: 'Ars Technica',
+    domain: 'arstechnica.com',
+    feedUrl: 'https://feeds.arstechnica.com/arstechnica/index',
+    siteUrl: 'https://arstechnica.com'
+  }
+];
+
+export function getNewsSource(id: string | undefined): NewsSourceDef {
+  return NEWS_SOURCES.find((s) => s.id === id) ?? NEWS_SOURCES[0];
+}
+
 // Finance assets — TGJU symbols + labels
 export type FinanceAssetId = 'usd' | 'gold' | 'eur';
 

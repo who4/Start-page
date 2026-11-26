@@ -1,13 +1,20 @@
-// High-res Favicon Fetcher + Post-Processing Engine (48x48 Retina Canvas).
-// Fetches the actual site favicon (Google 128px -> DuckDuckGo -> Icon Horse via /api/favicon),
-// extracts the icon's true dominant brand color, and renders it with fine Floyd-Steinberg
-// error-diffusion dithering + organic film noise while preserving the exact icon silhouette.
+// Direct-Site Favicon Fetcher + Clean Ordered-Halftone Post-Processing Engine.
+// Captures native SVG/PNG icons directly from each website (or Chrome's native /_favicon/ in extension mode),
+// extracts the icon's dominant brand color, and renders crisp 44x44 (2x Retina) icons with zero noisy dirt.
 
 import type { BookmarkIconStyle } from './types';
 
-const FAVICON_KEY = 'faviconCacheV3';
+const FAVICON_KEY = 'faviconCacheV4';
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const CANVAS_SIZE = 48; // 2x+ Retina detail for 22x22 CSS display
+const CANVAS_SIZE = 44; // Exact 2x Retina for 22x22 CSS display (zero nearest-neighbor aliasing)
+
+// Normalized 4x4 Bayer ordered dithering threshold matrix (values in 0..1)
+const BAYER_4X4 = [
+  [0 / 16, 8 / 16, 2 / 16, 10 / 16],
+  [12 / 16, 4 / 16, 14 / 16, 6 / 16],
+  [3 / 16, 11 / 16, 1 / 16, 9 / 16],
+  [15 / 16, 7 / 16, 13 / 16, 5 / 16]
+];
 
 interface CacheEntry {
   dataUrl: string;
@@ -66,27 +73,62 @@ function blobToDataUrl(blob: Blob): Promise<string | null> {
   });
 }
 
-async function fetchFaviconDataUrl(domain: string): Promise<string | null> {
-  const endpoints = isExtensionContext()
-    ? [
-        `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`,
-        `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico`
-      ]
-    : [`/api/favicon?domain=${encodeURIComponent(domain)}`];
-
-  for (const endpoint of endpoints) {
+async function fetchViaBackgroundFavicon(domain: string): Promise<string | null> {
+  return new Promise((resolve) => {
     try {
-      const response = await fetch(endpoint, { credentials: 'omit' });
-      if (!response.ok) continue;
-      const blob = await response.blob();
-      if (blob.size < 80) continue;
-      const dataUrl = await blobToDataUrl(blob);
-      if (dataUrl && !dataUrl.endsWith('AA==')) {
-        return dataUrl;
-      }
+      chrome.runtime.sendMessage({ action: 'GET_FAVICON', domain }, (response) => {
+        if (chrome.runtime.lastError || !response?.success || typeof response.data !== 'string') {
+          resolve(null);
+          return;
+        }
+        resolve(response.data);
+      });
     } catch {
-      // try next endpoint
+      resolve(null);
     }
+  });
+}
+
+async function fetchChromeNativeFavicon(fullUrl: string): Promise<string | null> {
+  try {
+    const nativeUrl = chrome.runtime.getURL(
+      `/_favicon/?pageUrl=${encodeURIComponent(fullUrl)}&size=64`
+    );
+    const resp = await fetch(nativeUrl);
+    if (!resp.ok) return null;
+    const blob = await resp.blob();
+    if (blob.size < 80) return null;
+    return await blobToDataUrl(blob);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchFaviconDataUrl(domain: string, fullUrl: string): Promise<string | null> {
+  if (isExtensionContext()) {
+    // 1. Direct website HTML/SVG/PNG icon capture via extension background worker
+    const direct = await fetchViaBackgroundFavicon(domain);
+    if (direct) return direct;
+    // 2. Chrome MV3 built-in local /_favicon/ API (zero 3rd-party dependency)
+    const native = await fetchChromeNativeFavicon(fullUrl);
+    if (native) return native;
+    return null;
+  }
+
+  // Web preview: direct website HTML/SVG/PNG discovery via /api/favicon
+  try {
+    const response = await fetch(`/api/favicon?domain=${encodeURIComponent(domain)}`, {
+      credentials: 'omit'
+    });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    if (blob.size < 60) return null;
+    const dataUrl = await blobToDataUrl(blob);
+    if (dataUrl && !dataUrl.endsWith('AA==')) {
+      return dataUrl;
+    }
+  } catch {
+    // fallback handled by monogram
   }
   return null;
 }
@@ -94,6 +136,7 @@ async function fetchFaviconDataUrl(domain: string): Promise<string | null> {
 export async function getFaviconDataUrl(url: string): Promise<string | null> {
   const domain = domainOf(url);
   if (!domain) return null;
+  const fullUrl = url.startsWith('http') ? url : `https://${url}`;
 
   if (memoryCache.has(domain)) {
     return memoryCache.get(domain) ?? null;
@@ -110,7 +153,7 @@ export async function getFaviconDataUrl(url: string): Promise<string | null> {
       return entry.dataUrl;
     }
 
-    const dataUrl = await fetchFaviconDataUrl(domain);
+    const dataUrl = await fetchFaviconDataUrl(domain, fullUrl);
     if (dataUrl) {
       cache[domain] = { dataUrl, fetchedAt: Date.now() };
       writeCache(cache);
@@ -175,14 +218,6 @@ function isDarkScheme(): boolean {
   return document.documentElement.dataset.colorScheme !== 'light';
 }
 
-// Fast deterministic pixel noise in [-1, 1] for subtle analog grain
-function pixelNoise(x: number, y: number): number {
-  let n = (x * 374761393 + y * 668265263) ^ 0x5bf03635;
-  n = Math.imul(n ^ (n >>> 13), 1274126177);
-  n = n ^ (n >>> 16);
-  return ((n >>> 0) / 4294967295) * 2 - 1;
-}
-
 function extractDominantSolidColor(pixels: Uint8ClampedArray): {
   rgb: [number, number, number];
   isChromatic: boolean;
@@ -197,7 +232,7 @@ function extractDominantSolidColor(pixels: Uint8ClampedArray): {
 
   for (let i = 0; i < pixels.length; i += 4) {
     const a = pixels[i + 3];
-    if (a < 64) continue;
+    if (a < 100) continue;
     opaqueTotal++;
 
     const r = pixels[i];
@@ -205,11 +240,11 @@ function extractDominantSolidColor(pixels: Uint8ClampedArray): {
     const b = pixels[i + 2];
     const [h, s, l] = rgbToHsl(r, g, b);
 
-    if (s < 0.15 || l < 0.08 || l > 0.94) continue;
+    if (s < 0.16 || l < 0.08 || l > 0.93) continue;
     chromaticTotal++;
 
     const sector = Math.floor(h * 36) % 36;
-    const weight = (a / 255) * (0.25 + s * 2.0) * (1 - Math.abs(l - 0.5) * 0.6);
+    const weight = (a / 255) * (0.25 + s * 2.2) * (1 - Math.abs(l - 0.5) * 0.55);
     const existing = buckets.get(sector);
     if (existing) {
       existing.weight += weight;
@@ -227,20 +262,20 @@ function extractDominantSolidColor(pixels: Uint8ClampedArray): {
     if (!best || b.weight > best.weight) best = b;
   }
 
-  if (best && opaqueTotal > 0 && chromaticTotal / opaqueTotal > 0.05) {
+  if (best && opaqueTotal > 0 && chromaticTotal / opaqueTotal > 0.04) {
     const avgR = best.rSum / best.weight;
     const avgG = best.gSum / best.weight;
     const avgB = best.bSum / best.weight;
     const [h, s, l] = rgbToHsl(avgR, avgG, avgB);
-    const calibratedS = Math.min(0.96, Math.max(0.58, s));
+    const calibratedS = Math.min(0.95, Math.max(0.60, s));
     const calibratedL = dark
-      ? Math.min(0.72, Math.max(0.54, l))
-      : Math.min(0.46, Math.max(0.30, l));
+      ? Math.min(0.70, Math.max(0.55, l))
+      : Math.min(0.45, Math.max(0.30, l));
     return { rgb: hslToRgb(h, calibratedS, calibratedL), isChromatic: true };
   }
 
   return {
-    rgb: dark ? [228, 228, 232] : [32, 34, 38],
+    rgb: dark ? [228, 228, 232] : [28, 30, 34],
     isChromatic: false
   };
 }
@@ -255,15 +290,11 @@ function loadImage(src: string): Promise<HTMLImageElement | null> {
   });
 }
 
-// Compute a clean perceptual ink density buffer (0..1) that preserves the ACTUAL favicon silhouette:
-// - Colored badge + white inner symbol (YouTube, Reddit, LinkedIn) -> solid dithered badge + crisp knockout glyph
-// - Colored badge + dark inner symbol (Spotify) -> solid dithered badge + crisp knockout glyph
-// - White square card + dark/colored logo -> drops white box, inks the logo
-// - Dark silhouette on transparent (GitHub, X, Notion) -> inks the entire silhouette sharply
-// - Detailed / multicolored mark on transparent (Gmail, Google, Wikipedia) -> preserves folds & contrast
-function buildInkDensityField(src: Uint8ClampedArray, size: number): {
+// Compute a razor-clean perceptual density & crisp edge alpha field (0..1).
+// Eliminates anti-aliased fringe dirt and cleanly separates badge knockouts & white boxes.
+function buildCleanInkField(src: Uint8ClampedArray, size: number): {
   density: Float32Array;
-  mask: Uint8Array;
+  edgeAlpha: Float32Array;
 } {
   const n = size * size;
   const lumArr = new Float32Array(n);
@@ -292,19 +323,19 @@ function buildInkDensityField(src: Uint8ClampedArray, size: number): {
     lumArr[i] = lum;
     satArr[i] = s;
 
-    if (a > 0.35) {
+    if (a > 0.45) {
       opaqueCount++;
       lumSum += lum;
       if (lum < minLum) minLum = lum;
       if (lum > maxLum) maxLum = lum;
-      if (s >= 0.18 && l >= 0.12 && l <= 0.9) chromaticCount++;
-      if (s < 0.14 && lum > 0.84) whiteCount++;
-      if (lum < 0.16) veryDarkCount++;
+      if (s >= 0.18 && l >= 0.12 && l <= 0.90) chromaticCount++;
+      if (s < 0.14 && lum > 0.85) whiteCount++;
+      if (lum < 0.15) veryDarkCount++;
     }
   }
 
-  // Sample inner-corner points (inset by 4px to catch rounded squares)
-  const inset = 4;
+  // Sample inset corners to detect solid white square/rounded-square icon cards
+  const inset = 5;
   const corners = [
     inset * size + inset,
     inset * size + (size - 1 - inset),
@@ -314,9 +345,9 @@ function buildInkDensityField(src: Uint8ClampedArray, size: number): {
   let opaqueCorners = 0;
   let whiteCorners = 0;
   for (const idx of corners) {
-    if (alphaArr[idx] > 0.7) {
+    if (alphaArr[idx] > 0.72) {
       opaqueCorners++;
-      if (satArr[idx] < 0.14 && lumArr[idx] > 0.84) whiteCorners++;
+      if (satArr[idx] < 0.14 && lumArr[idx] > 0.85) whiteCorners++;
     }
   }
 
@@ -324,70 +355,72 @@ function buildInkDensityField(src: Uint8ClampedArray, size: number): {
   const whiteFrac = opaqueCount > 0 ? whiteCount / opaqueCount : 0;
   const darkFrac = opaqueCount > 0 ? veryDarkCount / opaqueCount : 0;
   const avgLum = opaqueCount > 0 ? lumSum / opaqueCount : 0.5;
-  const lumRange = Math.max(0.18, maxLum - minLum);
+  const lumRange = Math.max(0.20, maxLum - minLum);
 
   const hasWhiteCardBg = whiteCorners >= 3 && opaqueCorners >= 3;
   const isColoredBadgeWithWhiteGlyph =
-    !hasWhiteCardBg && chromaticFrac > 0.32 && whiteFrac > 0.03 && whiteFrac < 0.52;
+    !hasWhiteCardBg && chromaticFrac > 0.30 && whiteFrac > 0.03 && whiteFrac < 0.54;
   const isColoredBadgeWithDarkGlyph =
     !hasWhiteCardBg && !isColoredBadgeWithWhiteGlyph && chromaticFrac > 0.35 && darkFrac > 0.04 && darkFrac < 0.45;
   const isDarkSilhouette =
-    !hasWhiteCardBg && opaqueCorners <= 2 && chromaticFrac < 0.18 && avgLum < 0.36;
+    !hasWhiteCardBg && opaqueCorners <= 2 && chromaticFrac < 0.18 && avgLum < 0.38;
 
   const density = new Float32Array(n);
-  const mask = new Uint8Array(n);
+  const edgeAlpha = new Float32Array(n);
 
   for (let i = 0; i < n; i++) {
     const a = alphaArr[i];
-    if (a < 0.14) continue;
+    if (a < 0.18) continue;
 
     const lum = lumArr[i];
     const sat = satArr[i];
     let d = 0;
+    let ea = a;
 
     if (hasWhiteCardBg) {
-      // Drop pure-white outer square; keep the logo inside strong and sharp
+      // Cleanly drop white outer card so only the emblem renders
       const whiteness = (1 - sat) * lum;
-      if (whiteness > 0.86) continue;
-      d = Math.min(1, ((1 - lum) * 0.95 + sat * 0.55) * 1.15) * a;
+      if (whiteness > 0.84) continue;
+      const strength = Math.min(1, ((1 - lum) * 1.15 + sat * 0.75) * 1.25);
+      d = 0.45 + 0.55 * strength;
+      ea = Math.min(1, a * Math.min(1, (0.88 - whiteness) * 6));
     } else if (isColoredBadgeWithWhiteGlyph) {
-      // e.g. YouTube red badge + white play triangle, Reddit orange + white alien, LinkedIn blue + white "in"
-      const isWhiteGlyph = sat < 0.16 && lum > 0.78;
+      // YouTube, Reddit, LinkedIn, etc. — solid clean badge + zero-speckle knockout glyph
+      const isWhiteGlyph = sat < 0.18 && lum > 0.76;
       if (isWhiteGlyph) {
-        // Crisp negative-space knockout so the inner symbol is unmistakably sharp
-        d = Math.max(0, (0.94 - lum) * 0.5) * a;
+        d = 0;
+        ea = 0;
       } else {
-        // Finely stippled solid brand-color badge body
-        const shade = 0.72 + 0.24 * Math.min(1, sat + (1 - Math.abs(lum - 0.48)));
-        d = shade * a;
+        d = 0.80 + 0.18 * Math.min(1, sat + (1 - Math.abs(lum - 0.5)) * 0.5);
       }
     } else if (isColoredBadgeWithDarkGlyph) {
-      // e.g. Spotify green circle + black sound waves
-      if (lum < 0.2 && sat < 0.22) {
-        d = lum * 0.4 * a;
+      // Spotify, etc. — solid clean badge + crisp dark-wave knockout
+      if (lum < 0.22 && sat < 0.24) {
+        d = 0;
+        ea = 0;
       } else {
-        d = (0.76 + 0.2 * Math.min(1, sat)) * a;
+        d = 0.82 + 0.16 * Math.min(1, sat);
       }
     } else if (isDarkSilhouette) {
-      // e.g. GitHub black octocat, X logo, Notion, Apple on transparent
-      d = (0.74 + 0.26 * (1 - lum)) * a;
+      // GitHub, X, Notion, Apple — solid clean silhouette
+      d = 0.82 + 0.18 * (1 - lum);
     } else {
-      // e.g. Gmail 'M', Google 'G', Wikipedia 3D globe, Figma, Slack
+      // Gmail, Google, Wikipedia globe, Figma, Slack
       const stretched = (lum - minLum) / lumRange;
       if (chromaticFrac < 0.15) {
-        // Grayscale detailed icon (like Wikipedia globe): keep bright facets inked, dark ink lines carved out
-        d = (0.14 + 0.86 * stretched) * a;
+        // Monochrome detailed emblem (e.g., Wikipedia globe): clear highlight vs ink contrast
+        d = 0.18 + 0.80 * stretched;
       } else {
-        // Multicolored transparent mark (Gmail, Google, Figma): strong uniform readability + fold shading
-        d = (0.58 + 0.40 * (0.5 * stretched + 0.5 * sat)) * a;
+        // Multicolored emblem on transparent: strong, clean, readable presence
+        d = 0.68 + 0.30 * (0.45 * stretched + 0.55 * sat);
       }
     }
 
-    mask[i] = 1;
     density[i] = Math.max(0, Math.min(1, d));
+    edgeAlpha[i] = Math.max(0, Math.min(1, ea));
   }
 
-  return { density, mask };
+  return { density, edgeAlpha };
 }
 
 function renderProcessedIcon(
@@ -398,7 +431,7 @@ function renderProcessedIcon(
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
-  canvas.className = 'shortcut-favicon-canvas';
+  canvas.className = 'shortcut-favicon-canvas' + (style === 'original' ? ' is-original' : '');
   canvas.setAttribute('aria-hidden', 'true');
 
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -407,94 +440,78 @@ function renderProcessedIcon(
   ctx.clearRect(0, 0, size, size);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  // Draw with 2px breathing inset so edge strokes never clip
-  ctx.drawImage(img, 2, 2, size - 4, size - 4);
+
+  // Preserve aspect ratio inside a clean centered box with 2px breathing inset
+  const maxDim = size - 4;
+  const nw = img.naturalWidth || maxDim;
+  const nh = img.naturalHeight || maxDim;
+  const scale = Math.min(maxDim / nw, maxDim / nh);
+  const dw = nw * scale;
+  const dh = nh * scale;
+  const dx = (size - dw) / 2;
+  const dy = (size - dh) / 2;
+  ctx.drawImage(img, dx, dy, dw, dh);
+
+  // 'original' mode: crisp native captured site icon without color/dither manipulation
+  if (style === 'original') {
+    return canvas;
+  }
 
   const src = ctx.getImageData(0, 0, size, size).data;
   const dark = isDarkScheme();
   const extracted = extractDominantSolidColor(src);
   const [cr, cg, cb] =
     style === 'monochrome'
-      ? (dark ? [226, 226, 230] : [32, 34, 38])
+      ? (dark ? [228, 228, 232] : [28, 30, 34])
       : extracted.rgb;
 
-  const { density, mask } = buildInkDensityField(src, size);
+  const { density, edgeAlpha } = buildCleanInkField(src, size);
   const out = ctx.createImageData(size, size);
   const dst = out.data;
 
-  if (style === 'grain') {
-    // Smooth solid-brand-color icon with tactile analog film grain noise (no binary cutoff)
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        const i = y * size + x;
-        if (!mask[i]) continue;
-        const grain = pixelNoise(x, y) * 0.16;
-        const alpha = Math.max(0, Math.min(1, density[i] + grain));
-        if (alpha < 0.05) continue;
-        const p = i * 4;
-        dst[p] = cr;
-        dst[p + 1] = cg;
-        dst[p + 2] = cb;
-        dst[p + 3] = Math.round(alpha * 255);
-      }
+  if (style === 'solid') {
+    // Clean, razor-sharp anti-aliased silhouette in the extracted solid brand color
+    for (let i = 0; i < size * size; i++) {
+      const ea = edgeAlpha[i];
+      if (ea < 0.08) continue;
+      const d = density[i];
+      if (d < 0.06) continue;
+      const alpha = Math.min(1, ea * (0.28 + 0.72 * d));
+      const p = i * 4;
+      dst[p] = cr;
+      dst[p + 1] = cg;
+      dst[p + 2] = cb;
+      dst[p + 3] = Math.round(alpha * 255);
     }
     ctx.putImageData(out, 0, 0);
     return canvas;
   }
 
-  // Default ('dithered') & 'monochrome':
-  // Fine 48x48 Floyd-Steinberg error-diffusion dithering + subtle organic noise
-  // Strictly single solid extracted brand color, razor-sharp silhouette, zero halo bleed.
-  const buf = new Float32Array(density.length);
+  // 'dithered' & 'monochrome':
+  // Crisp structured 4x4 Bayer ordered halftone on 2x2 Retina cells (= clean 1px CSS dots).
+  // Zero random noise speckles, zero perimeter fringe dirt, crisp silhouette preservation.
   for (let y = 0; y < size; y++) {
+    const by = (y >> 1) & 3;
     for (let x = 0; x < size; x++) {
       const i = y * size + x;
-      if (!mask[i]) continue;
-      // Add subtle deterministic film grain before error diffusion so solid areas have rich texture
-      buf[i] = Math.max(0, Math.min(1, density[i] + pixelNoise(x, y) * 0.08));
-    }
-  }
+      const ea = edgeAlpha[i];
+      if (ea < 0.44) continue; // Strict edge gate removes blurry fringe specks
 
-  for (let y = 0; y < size; y++) {
-    // Serpentine scan alternates left-to-right and right-to-left to eliminate directional streaking
-    const leftToRight = (y & 1) === 0;
-    const xStart = leftToRight ? 0 : size - 1;
-    const xEnd = leftToRight ? size : -1;
-    const xStep = leftToRight ? 1 : -1;
+      const d = density[i];
+      if (d <= 0.05) continue;
 
-    for (let x = xStart; x !== xEnd; x += xStep) {
-      const i = y * size + x;
-      if (!mask[i]) continue;
+      const bx = (x >> 1) & 3;
+      const threshold = BAYER_4X4[by][bx];
+      // Boost mid-high densities slightly so solid brand marks stay crisp and unmistakable
+      const tone = Math.min(0.96, d * 1.04);
 
-      const oldVal = buf[i];
-      const newVal = oldVal >= 0.48 ? 1 : 0;
-      const err = oldVal - newVal;
-
-      if (newVal === 1) {
+      if (tone > threshold) {
         const p = i * 4;
         dst[p] = cr;
         dst[p + 1] = cg;
         dst[p + 2] = cb;
-        dst[p + 3] = 255;
-      }
-
-      const nx = x + xStep;
-      const px = x - xStep;
-      const ny = y + 1;
-
-      if (nx >= 0 && nx < size && mask[y * size + nx]) {
-        buf[y * size + nx] += err * (7 / 16);
-      }
-      if (ny < size) {
-        if (px >= 0 && px < size && mask[ny * size + px]) {
-          buf[ny * size + px] += err * (3 / 16);
-        }
-        if (mask[ny * size + x]) {
-          buf[ny * size + x] += err * (5 / 16);
-        }
-        if (nx >= 0 && nx < size && mask[ny * size + nx]) {
-          buf[ny * size + nx] += err * (1 / 16);
-        }
+        // Soften only the outermost anti-aliased edge pixel for clean optical smoothness
+        dst[p + 3] = Math.round(Math.min(1, (ea - 0.35) / 0.55) * 255);
       }
     }
   }
@@ -503,7 +520,7 @@ function renderProcessedIcon(
   return canvas;
 }
 
-// --- Clean fallback monogram with fine grain if a domain has no reachable favicon ---
+// --- Clean geometric monogram fallback if a domain is completely unreachable ---
 
 const FALLBACK_HUES = [14, 210, 155, 38, 340, 265, 188, 92];
 
@@ -535,30 +552,35 @@ function renderFallbackMonogram(
       ? (dark ? [220, 220, 224] : [36, 36, 40])
       : hslToRgb(hueFor(domain) / 360, 0.72, dark ? 0.62 : 0.42);
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
-  ctx.lineWidth = 2.5;
-  ctx.strokeRect(5, 5, size - 10, size - 10);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '600 24px monospace';
+  ctx.strokeStyle = `rgb(${cr}, ${cg}, ${cb})`;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(4, 4, size - 8, size - 8);
+  ctx.fillStyle = `rgb(${cr}, ${cg}, ${cb})`;
+  ctx.font = '600 22px monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText((domain[0] || '?').toUpperCase(), size / 2, size / 2 + 1);
+
+  if (style === 'solid' || style === 'original') {
+    return canvas;
+  }
 
   const src = ctx.getImageData(0, 0, size, size).data;
   const out = ctx.createImageData(size, size);
   const dst = out.data;
 
   for (let y = 0; y < size; y++) {
+    const by = (y >> 1) & 3;
     for (let x = 0; x < size; x++) {
       const p = (y * size + x) * 4;
       const a = src[p + 3] / 255;
-      if (a < 0.1) continue;
-      const intensity = a + pixelNoise(x, y) * 0.14;
-      if (intensity > 0.42) {
+      if (a < 0.35) continue;
+      const threshold = BAYER_4X4[by][(x >> 1) & 3] * 0.7;
+      if (a > threshold) {
         dst[p] = cr;
         dst[p + 1] = cg;
         dst[p + 2] = cb;
-        dst[p + 3] = 255;
+        dst[p + 3] = Math.round(a * 255);
       }
     }
   }

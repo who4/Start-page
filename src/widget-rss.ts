@@ -1,4 +1,5 @@
 // Multi-source RSS Reader & Breaking Headlines module.
+import { ApiClient } from './api';
 import { storage } from './storage';
 import type { WidgetDef } from './grid';
 
@@ -22,6 +23,11 @@ interface RssItem {
 
 const CURATED_FEEDS: Array<{ title: string; url: string }> = [
   { title: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
+  {
+    title: 'Iran Monitor',
+    url: 'https://news.google.com/rss/search?q=site:iranmonitor.org&hl=en-US&gl=US&ceid=US:en'
+  },
+  { title: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
   { title: 'Hacker News', url: 'https://hnrss.org/frontpage' },
   { title: 'The Verge', url: 'https://www.theverge.com/rss/index.xml' },
   { title: 'Ars Technica', url: 'https://feeds.arstechnica.com/arstechnica/index' }
@@ -50,33 +56,15 @@ async function saveItems(items: RssItem[]): Promise<void> {
 async function fetchFeed(
   url: string
 ): Promise<{ title: string; items: Array<{ title: string; link: string; pubDate: number }> }> {
-  const rssApiUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}`;
-  try {
-    const responseText = await new Promise<string>((resolve, reject) => {
-      chrome.runtime.sendMessage({ action: 'PROXY_FETCH', url: rssApiUrl }, (response) => {
-        if (chrome.runtime.lastError || !response?.success) {
-          reject(new Error(chrome.runtime.lastError?.message || 'Failed'));
-          return;
-        }
-        resolve(response.data as string);
-      });
-    });
-    const data = JSON.parse(responseText);
-    if (data.status !== 'ok') return { title: '', items: [] };
-    return {
-      title: data.feed?.title || '',
-      items: (data.items || []).map((item: { title: string; link: string; pubDate: string }) => {
-        const ts = new Date((item.pubDate || '').replace(' ', 'T') + (item.pubDate?.endsWith('Z') ? '' : 'Z')).getTime();
-        return {
-          title: item.title || 'Untitled',
-          link: item.link || '',
-          pubDate: Number.isFinite(ts) ? ts : Date.now()
-        };
-      })
-    };
-  } catch {
-    return { title: '', items: [] };
-  }
+  const result = await ApiClient.fetchRssFeed(url);
+  return {
+    title: result.title,
+    items: result.items.map((item) => ({
+      title: item.title || 'Untitled',
+      link: item.link || '',
+      pubDate: item.pubDate || Date.now()
+    }))
+  };
 }
 
 async function refreshAllFeeds(): Promise<void> {
