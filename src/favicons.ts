@@ -5,8 +5,10 @@
 import type { BookmarkIconStyle } from './types';
 
 const FAVICON_KEY = 'faviconCacheV4';
+const PROCESSED_KEY = 'faviconProcessedV5';
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CANVAS_SIZE = 44; // Exact 2x Retina for 22x22 CSS display (zero nearest-neighbor aliasing)
+const MAX_CONCURRENT_FETCHES = 2;
 
 // Normalized 4x4 Bayer ordered dithering threshold matrix (values in 0..1)
 const BAYER_4X4 = [
@@ -26,6 +28,31 @@ type FaviconCache = Record<string, CacheEntry>;
 const memoryCache = new Map<string, string | null>();
 const inflightFetches = new Map<string, Promise<string | null>>();
 
+let rawCacheData: FaviconCache | null = null;
+let processedCacheData: FaviconCache | null = null;
+let cachesLoadPromise: Promise<void> | null = null;
+let flushTimer: number | undefined;
+let rawDirty = false;
+let processedDirty = false;
+
+// Simple concurrency limiter so uncached favicon fetches never flood Chrome's network stack
+let activeFetches = 0;
+const fetchWaiters: Array<() => void> = [];
+
+async function withFetchSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeFetches >= MAX_CONCURRENT_FETCHES) {
+    await new Promise<void>((resolve) => fetchWaiters.push(resolve));
+  }
+  activeFetches++;
+  try {
+    return await fn();
+  } finally {
+    activeFetches--;
+    const next = fetchWaiters.shift();
+    if (next) next();
+  }
+}
+
 function isExtensionContext(): boolean {
   return (
     typeof chrome !== 'undefined' &&
@@ -34,24 +61,47 @@ function isExtensionContext(): boolean {
   );
 }
 
-function readCache(): Promise<FaviconCache> {
-  return new Promise((resolve) => {
+function ensureCachesLoaded(): Promise<void> {
+  if (rawCacheData && processedCacheData) return Promise.resolve();
+  if (cachesLoadPromise) return cachesLoadPromise;
+
+  cachesLoadPromise = new Promise<void>((resolve) => {
     try {
-      chrome.storage.local.get([FAVICON_KEY], (result) => {
-        resolve((result?.[FAVICON_KEY] as FaviconCache | undefined) ?? {});
+      chrome.storage.local.get([FAVICON_KEY, PROCESSED_KEY], (result) => {
+        rawCacheData = (result?.[FAVICON_KEY] as FaviconCache | undefined) ?? {};
+        processedCacheData = (result?.[PROCESSED_KEY] as FaviconCache | undefined) ?? {};
+        resolve();
       });
     } catch {
-      resolve({});
+      rawCacheData = {};
+      processedCacheData = {};
+      resolve();
     }
   });
+  return cachesLoadPromise;
 }
 
-function writeCache(cache: FaviconCache): void {
-  try {
-    chrome.storage.local.set({ [FAVICON_KEY]: cache });
-  } catch {
-    // storage unavailable
-  }
+function scheduleCacheFlush(): void {
+  if (flushTimer !== undefined) return;
+  flushTimer = window.setTimeout(() => {
+    flushTimer = undefined;
+    const payload: Record<string, FaviconCache> = {};
+    if (rawDirty && rawCacheData) {
+      payload[FAVICON_KEY] = rawCacheData;
+      rawDirty = false;
+    }
+    if (processedDirty && processedCacheData) {
+      payload[PROCESSED_KEY] = processedCacheData;
+      processedDirty = false;
+    }
+    if (Object.keys(payload).length > 0) {
+      try {
+        chrome.storage.local.set(payload);
+      } catch {
+        // storage unavailable
+      }
+    }
+  }, 400);
 }
 
 export function domainOf(url: string): string {
@@ -146,17 +196,19 @@ export async function getFaviconDataUrl(url: string): Promise<string | null> {
   if (pending) return pending;
 
   const task = (async (): Promise<string | null> => {
-    const cache = await readCache();
+    await ensureCachesLoaded();
+    const cache = rawCacheData!;
     const entry = cache[domain];
     if (entry && Date.now() - entry.fetchedAt < CACHE_TTL_MS && entry.dataUrl) {
       memoryCache.set(domain, entry.dataUrl);
       return entry.dataUrl;
     }
 
-    const dataUrl = await fetchFaviconDataUrl(domain, fullUrl);
+    const dataUrl = await withFetchSlot(() => fetchFaviconDataUrl(domain, fullUrl));
     if (dataUrl) {
       cache[domain] = { dataUrl, fetchedAt: Date.now() };
-      writeCache(cache);
+      rawDirty = true;
+      scheduleCacheFlush();
       memoryCache.set(domain, dataUrl);
       return dataUrl;
     }
@@ -606,6 +658,21 @@ function renderFallbackMonogram(
   return canvas;
 }
 
+function createCachedImgElement(
+  dataUrl: string,
+  style: Exclude<BookmarkIconStyle, 'off'>
+): HTMLImageElement {
+  const img = document.createElement('img');
+  img.src = dataUrl;
+  img.width = 22;
+  img.height = 22;
+  img.decoding = 'async';
+  img.alt = '';
+  img.className = 'shortcut-favicon-canvas' + (style === 'original' ? ' is-original' : '');
+  img.setAttribute('aria-hidden', 'true');
+  return img;
+}
+
 export async function createFaviconElement(
   url: string,
   style: BookmarkIconStyle = 'dithered'
@@ -614,11 +681,34 @@ export async function createFaviconElement(
   const domain = domainOf(url);
   if (!domain) return null;
 
+  await ensureCachesLoaded();
+  const scheme = isDarkScheme() ? 'dark' : 'light';
+  const processedKey = `${domain}:${style}:${scheme}`;
+  const cachedProcessed = processedCacheData?.[processedKey];
+  if (
+    cachedProcessed &&
+    cachedProcessed.dataUrl &&
+    Date.now() - cachedProcessed.fetchedAt < CACHE_TTL_MS
+  ) {
+    return createCachedImgElement(cachedProcessed.dataUrl, style);
+  }
+
   const dataUrl = await getFaviconDataUrl(url);
   if (dataUrl) {
     const img = await loadImage(dataUrl);
     if (img && img.naturalWidth > 0) {
-      return renderProcessedIcon(img, style);
+      const canvas = renderProcessedIcon(img, style);
+      try {
+        const pngDataUrl = canvas.toDataURL('image/png');
+        if (pngDataUrl && processedCacheData) {
+          processedCacheData[processedKey] = { dataUrl: pngDataUrl, fetchedAt: Date.now() };
+          processedDirty = true;
+          scheduleCacheFlush();
+        }
+      } catch {
+        // canvas serialization skipped
+      }
+      return canvas;
     }
   }
 

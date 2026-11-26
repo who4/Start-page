@@ -1,8 +1,8 @@
 import './chrome-shim';
-import { ApiClient } from './api';
+import { ApiClient, type NewsArticle, type PriceData } from './api';
 import { attachPasteCapture, getEmptyStateResults } from './chrome-providers';
 import { ActionRegistry, CommandBarEngine, type BarResult } from './commandbar';
-import { getNewsSource, hostOfUrl, INTERVALS, SUGGESTIONS } from './constants';
+import { getNewsSource, hostOfUrl, INTERVALS, STARTER_SHORTCUTS, STORAGE_KEYS, SUGGESTIONS } from './constants';
 import { createFaviconElement } from './favicons';
 import { BentoGrid, registry } from './grid';
 import { t } from './i18n';
@@ -11,23 +11,73 @@ import { SpatialScratchpad } from './scratchpad';
 import { SettingsUI } from './settings-ui';
 import { storage } from './storage';
 import { applyTheme, THEME_PRESETS } from './themes';
-import type { Settings, Shortcut } from './types';
+import type { NoteData, Settings, Shortcut } from './types';
 import { createCalendarWidget } from './widget-calendar';
 import { appendPricePoint, createFinanceWidget } from './widget-finance';
 import { createRssWidget } from './widget-rss';
-import { aqiDescriptor, createWeatherWidget, fetchWeatherData, formatTemp } from './widget-weather';
+import {
+  aqiDescriptor,
+  createWeatherWidget,
+  fetchWeatherData,
+  formatTemp,
+  getCachedWeather,
+  type WeatherSnapshot
+} from './widget-weather';
+
+// Activate Google Fonts asynchronously without blocking first paint (MV3 CSP-safe)
+const fontsLink = document.getElementById('google-fonts-link') as HTMLLinkElement | null;
+if (fontsLink && fontsLink.media !== 'all') {
+  const activateFonts = (): void => {
+    fontsLink.media = 'all';
+  };
+  if (fontsLink.sheet) {
+    activateFonts();
+  } else {
+    fontsLink.addEventListener('load', activateFonts, { once: true });
+    window.setTimeout(activateFonts, 60);
+  }
+}
 
 // --- Helpers ---
 const isHttpUrl = (url: string): boolean => /^https?:\/\//i.test(url);
 const ensureUrl = (url: string): string => (isHttpUrl(url) ? url : `https://${url}`);
 
+function scheduleIdle(fn: () => void, timeoutMs = 240): void {
+  const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number })
+    .requestIdleCallback;
+  if (typeof ric === 'function') {
+    ric(fn, { timeout: timeoutMs });
+  } else {
+    window.setTimeout(fn, 60);
+  }
+}
+
+const preconnectedOrigins = new Set<string>();
+function preconnectUrl(url: string): void {
+  try {
+    const origin = new URL(url).origin;
+    if (!origin.startsWith('http') || preconnectedOrigins.has(origin) || preconnectedOrigins.size >= 16) return;
+    preconnectedOrigins.add(origin);
+    const link = document.createElement('link');
+    link.rel = 'preconnect';
+    link.href = origin;
+    document.head.appendChild(link);
+  } catch {
+    // ignore invalid URL
+  }
+}
+
 // --- Global runtime state ---
 let settings!: Settings;
 let settingsUI: SettingsUI | null = null;
 let deckGrid: BentoGrid | null = null;
+let deckInitialized = false;
+let deckInitPromise: Promise<void> | null = null;
+let deckNeedsRefresh = false;
 let scratchpad: SpatialScratchpad | null = null;
 let drawerOpen = false;
 let shortcutsCache: Shortcut[] = [];
+let persistSettingsFn: ((updated: Settings) => Promise<void>) | null = null;
 
 // --- Toast system (non-blocking, with optional Undo) ---
 let toastTimer: number | undefined;
@@ -69,6 +119,9 @@ function showToast(message: string, onUndo?: () => void): void {
 }
 
 // --- Clock & Dual Date ---
+let lastDateCacheKey = '';
+let lastDateDisplay = '';
+
 const updateTime = (): void => {
   const now = new Date();
   const timeEl = document.getElementById('time-display');
@@ -86,36 +139,114 @@ const updateTime = (): void => {
   const dateEl = document.getElementById('date-display');
   if (!dateEl) return;
 
-  const gregStr = now.toLocaleDateString('en-US', {
-    weekday: 'long',
-    month: 'short',
-    day: 'numeric'
-  });
-  const jalaliStr = formatJalaliDate(now);
-
-  if (settings?.general.showDualDate ?? true) {
-    dateEl.textContent =
-      settings?.general.calendar === 'jalali'
-        ? `${jalaliStr}  ·  ${gregStr}`
-        : `${gregStr}  ·  ${jalaliStr}`;
-  } else {
-    dateEl.textContent = settings?.general.calendar === 'jalali' ? jalaliStr : gregStr;
+  const calMode = settings?.general.calendar ?? 'gregorian';
+  const showDual = settings?.general.showDualDate ?? true;
+  const dateKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}|${calMode}|${showDual ? 1 : 0}`;
+  if (dateKey !== lastDateCacheKey) {
+    lastDateCacheKey = dateKey;
+    const gregStr = now.toLocaleDateString('en-US', {
+      weekday: 'long',
+      month: 'short',
+      day: 'numeric'
+    });
+    const jalaliStr = formatJalaliDate(now);
+    if (showDual) {
+      lastDateDisplay =
+        calMode === 'jalali' ? `${jalaliStr}  ·  ${gregStr}` : `${gregStr}  ·  ${jalaliStr}`;
+    } else {
+      lastDateDisplay = calMode === 'jalali' ? jalaliStr : gregStr;
+    }
+    dateEl.textContent = lastDateDisplay;
   }
 };
 
 let clockTimer: number | undefined;
 function startClock(): void {
   window.clearInterval(clockTimer);
+  lastDateCacheKey = '';
   updateTime();
   clockTimer = window.setInterval(updateTime, 1000);
 }
 
-// --- Modular Workspace Drawer ---
+// --- Modular Workspace Drawer (Lazy-mounted on first open) ---
 const drawerEl = document.getElementById('workspace-drawer')!;
 const drawerBackdrop = document.getElementById('drawer-backdrop')!;
 const deckHandleBtn = document.getElementById('deck-handle-btn');
 const drawerCloseBtn = document.getElementById('drawer-close-btn');
 const drawerCustomizeBtn = document.getElementById('drawer-customize-btn');
+
+let deckModulesRegistered = false;
+function registerDeckModules(): void {
+  if (deckModulesRegistered) return;
+  deckModulesRegistered = true;
+
+  registry.register(
+    createFinanceWidget({
+      getSettings: () => settings,
+      onUpdateAlerts: async (alerts) => {
+        if (!persistSettingsFn) return;
+        const next = structuredClone(settings);
+        next.finance.alerts = alerts;
+        await persistSettingsFn(next);
+      }
+    })
+  );
+
+  registry.register(
+    createWeatherWidget({
+      getSettings: () => settings,
+      onUpdateLocation: async (loc) => {
+        if (!persistSettingsFn) return;
+        const next = structuredClone(settings);
+        next.weather = { ...loc, unit: next.weather.unit ?? 'c' };
+        await persistSettingsFn(next);
+      }
+    })
+  );
+
+  registry.register(createCalendarWidget({ getSettings: () => settings }));
+  registry.register(createRssWidget());
+}
+
+async function ensureDeckInitialized(): Promise<void> {
+  if (deckInitialized) return;
+  if (deckInitPromise) return deckInitPromise;
+
+  deckInitPromise = (async () => {
+    registerDeckModules();
+    const bentoContainer = document.getElementById('bento-container')!;
+    const deckShelf = document.getElementById('deck-shelf');
+    deckGrid = new BentoGrid({
+      container: bentoContainer,
+      shelfContainer: deckShelf
+    });
+    await deckGrid.init();
+    deckInitialized = true;
+    deckNeedsRefresh = false;
+  })();
+
+  return deckInitPromise;
+}
+
+async function openSettingsModal(section: 'general' | 'appearance' | 'commands' | 'modules' | 'privacy' = 'general'): Promise<void> {
+  registerDeckModules();
+  if (!settingsUI) {
+    settingsUI = new SettingsUI(settings, {
+      onChange: async (updated) => {
+        if (persistSettingsFn) await persistSettingsFn(updated);
+      },
+      onModulesChange: async () => {
+        if (deckInitialized && drawerOpen) {
+          await deckGrid?.refresh();
+        } else {
+          deckNeedsRefresh = true;
+        }
+      },
+      onToast: (msg) => showToast(msg)
+    });
+  }
+  await settingsUI.open(section);
+}
 
 function setDrawerOpen(open: boolean, persist = true): void {
   drawerOpen = open;
@@ -126,10 +257,14 @@ function setDrawerOpen(open: boolean, persist = true): void {
   deckHandleBtn?.setAttribute('aria-expanded', String(open));
   deckHandleBtn?.classList.toggle('is-open', open);
 
-  if (open && deckGrid) {
-    // Re-sync sparkline canvas widths once drawer opens
+  if (open) {
     requestAnimationFrame(() => {
-      void deckGrid?.refresh();
+      void ensureDeckInitialized().then(() => {
+        if (deckNeedsRefresh) {
+          deckNeedsRefresh = false;
+          return deckGrid?.refresh();
+        }
+      });
     });
   }
 
@@ -438,12 +573,17 @@ function renderShortcuts(shortcuts: Shortcut[]): void {
   const fragment = document.createDocumentFragment();
 
   shortcuts.forEach((shortcut, index) => {
+    const href = ensureUrl(shortcut.url || '');
     const card = document.createElement('a');
     card.className = 'nav-link shortcut-keycap';
-    card.href = ensureUrl(shortcut.url || '');
+    card.href = href;
     card.target = '_self';
     card.draggable = true;
     card.dataset.index = String(index);
+
+    // Preconnect DNS/TLS on hover or keyboard focus so clicking opens the site noticeably faster
+    card.addEventListener('pointerenter', () => preconnectUrl(href), { passive: true });
+    card.addEventListener('focus', () => preconnectUrl(href), { passive: true });
 
     const leftWrap = document.createElement('span');
     leftWrap.className = 'shortcut-left-wrap';
@@ -454,9 +594,9 @@ function renderShortcuts(shortcuts: Shortcut[]): void {
       iconSlot.setAttribute('aria-hidden', 'true');
       leftWrap.appendChild(iconSlot);
 
-      void createFaviconElement(shortcut.url || '', iconStyle).then((canvas) => {
-        if (renderSeq !== shortcutRenderSeq || !canvas) return;
-        iconSlot.replaceChildren(canvas);
+      void createFaviconElement(shortcut.url || '', iconStyle).then((el) => {
+        if (renderSeq !== shortcutRenderSeq || !el) return;
+        iconSlot.replaceChildren(el);
         iconSlot.classList.add('is-loaded');
       });
     }
@@ -646,14 +786,12 @@ saveShortcutBtn?.addEventListener('click', async () => {
   await loadShortcuts();
 });
 
-// --- Right Pane Live Telemetry (Markets + Weather + Breaking News) ---
-async function updatePrices(): Promise<void> {
+// --- Right Pane Live Telemetry (Cached-first + Deferred Stale Revalidation) ---
+function renderPriceMetrics(data: Partial<Record<'usd' | 'gold', PriceData>>, recordHistory: boolean): void {
   const usdEl = document.getElementById('price-usd');
   const goldEl = document.getElementById('price-gold');
   const usdBigEl = document.getElementById('price-usd-big');
-  if (!usdEl || !goldEl || !settings?.widgets.priceTicker) return;
-
-  const data = await ApiClient.fetchPrices();
+  if (!usdEl || !goldEl) return;
 
   const renderMetric = (
     el: HTMLElement,
@@ -669,7 +807,7 @@ async function updatePrices(): Promise<void> {
       return;
     }
     const rialNum = parseInt(rawPrice.replace(/,/g, ''), 10);
-    if (Number.isFinite(rialNum) && rialNum > 0) {
+    if (recordHistory && Number.isFinite(rialNum) && rialNum > 0) {
       void appendPricePoint(asset, rialNum, trend);
     }
     const toman = Number.isFinite(rialNum) ? Math.round(rialNum / 10) : NaN;
@@ -688,28 +826,31 @@ async function updatePrices(): Promise<void> {
     }
   };
 
-  renderMetric(usdEl, 'usd', 'USD', data.usd.price, data.usd.trend);
-  renderMetric(goldEl, 'gold', 'GOLD', data.gold.price, data.gold.trend);
+  if (data.usd) renderMetric(usdEl, 'usd', 'USD', data.usd.price, data.usd.trend);
+  if (data.gold) renderMetric(goldEl, 'gold', 'GOLD', data.gold.price, data.gold.trend);
 }
 
-async function updateNews(): Promise<void> {
+async function updatePrices(forceRefresh = false): Promise<void> {
+  if (!settings?.widgets.priceTicker) return;
+
+  if (!forceRefresh) {
+    const cached = await ApiClient.getCachedPrices(['usd', 'gold']);
+    if (cached.data.usd || cached.data.gold) {
+      renderPriceMetrics(cached.data, false);
+    }
+    if (cached.fresh) return;
+  }
+
+  const data = await ApiClient.fetchPrices(['usd', 'gold']);
+  renderPriceMetrics(data, true);
+}
+
+function renderNewsArticle(article: NewsArticle | null): void {
   const newsEl = document.getElementById('news-widget') as HTMLAnchorElement | null;
   const headlineEl = document.getElementById('news-headline');
   const sourceMetaEl = document.getElementById('news-source-meta');
-  if (!newsEl || !headlineEl || !settings?.widgets.newsWidget) return;
+  if (!newsEl || !headlineEl) return;
 
-  const activeSource =
-    settings.news?.sourceId === 'custom' && settings.news?.customUrl
-      ? hostOfUrl(settings.news.customUrl)
-      : getNewsSource(settings.news?.sourceId).name;
-  const activeKeywords = (settings.news?.keywords || []).filter((k) => k.trim().length > 0);
-
-  if (sourceMetaEl) {
-    sourceMetaEl.textContent =
-      activeKeywords.length > 0 ? `${activeSource} · ${activeKeywords.join(', ')}` : activeSource;
-  }
-
-  const article = await ApiClient.fetchNews(settings.news);
   if (article) {
     if (article.noKeywordMatch) {
       headlineEl.textContent = article.title;
@@ -736,15 +877,43 @@ async function updateNews(): Promise<void> {
   }
 }
 
+async function updateNews(forceRefresh = false): Promise<void> {
+  const newsEl = document.getElementById('news-widget') as HTMLAnchorElement | null;
+  const headlineEl = document.getElementById('news-headline');
+  const sourceMetaEl = document.getElementById('news-source-meta');
+  if (!newsEl || !headlineEl || !settings?.widgets.newsWidget) return;
+
+  const activeSource =
+    settings.news?.sourceId === 'custom' && settings.news?.customUrl
+      ? hostOfUrl(settings.news.customUrl)
+      : getNewsSource(settings.news?.sourceId).name;
+  const activeKeywords = (settings.news?.keywords || []).filter((k) => k.trim().length > 0);
+
+  if (sourceMetaEl) {
+    sourceMetaEl.textContent =
+      activeKeywords.length > 0 ? `${activeSource} · ${activeKeywords.join(', ')}` : activeSource;
+  }
+
+  if (!forceRefresh) {
+    const cached = await ApiClient.getCachedNews(settings.news);
+    if (cached.article) {
+      renderNewsArticle(cached.article);
+    }
+    if (cached.fresh) return;
+  }
+
+  const article = await ApiClient.fetchNews(settings.news, forceRefresh);
+  renderNewsArticle(article);
+}
+
 // --- Right Pane Atmosphere & AQI Telemetry ---
-async function updateHeroWeather(forceRefresh = false): Promise<void> {
+function renderHeroWeather(data: WeatherSnapshot | null): void {
   const tempEl = document.getElementById('hero-weather-temp');
   const metaEl = document.getElementById('hero-weather-meta');
   const aqiEl = document.getElementById('hero-weather-aqi');
   if (!tempEl || !metaEl || !aqiEl || !settings) return;
 
   const unit = settings.weather.unit ?? 'c';
-  const data = await fetchWeatherData(settings.weather, forceRefresh);
   if (!data) {
     tempEl.textContent = `--°${unit.toUpperCase()}`;
     metaEl.textContent = 'Weather offline';
@@ -758,6 +927,21 @@ async function updateHeroWeather(forceRefresh = false): Promise<void> {
   metaEl.textContent = `${data.city} / ${data.condition}`;
   aqiEl.textContent = `AQI ${data.aqi} · ${aqi.label}`;
   aqiEl.className = `price-item hero-aqi is-${aqi.level}`;
+}
+
+async function updateHeroWeather(forceRefresh = false): Promise<void> {
+  if (!settings) return;
+
+  if (!forceRefresh) {
+    const cached = await getCachedWeather(settings.weather);
+    if (cached.data) {
+      renderHeroWeather(cached.data);
+    }
+    if (cached.fresh) return;
+  }
+
+  const data = await fetchWeatherData(settings.weather, forceRefresh);
+  renderHeroWeather(data);
 }
 
 // --- Hero Daily Focus Line (auto-resets each morning) ---
@@ -774,7 +958,7 @@ function getTodayDateKey(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-async function initHeroFocus(): Promise<void> {
+async function initHeroFocus(preloaded?: FocusData): Promise<void> {
   const focusWrap = document.querySelector('.hero-focus');
   const toggleBtn = document.getElementById('focus-toggle-btn') as HTMLButtonElement | null;
   const focusInput = document.getElementById('focus-input') as HTMLInputElement | null;
@@ -782,11 +966,11 @@ async function initHeroFocus(): Promise<void> {
 
   const today = getTodayDateKey();
   let state: FocusData = { text: '', date: today, completed: false };
-  const stored = await storage.get<FocusData>(FOCUS_STORAGE_KEY);
+  const stored = preloaded !== undefined ? preloaded : await storage.get<FocusData>(FOCUS_STORAGE_KEY);
   if (stored && stored.date === today) {
     state = stored;
-  } else {
-    await storage.set(FOCUS_STORAGE_KEY, state);
+  } else if (stored) {
+    void storage.set(FOCUS_STORAGE_KEY, state);
   }
 
   const syncUi = (): void => {
@@ -842,7 +1026,7 @@ let priceTimer: number | undefined;
 let newsTimer: number | undefined;
 let weatherTimer: number | undefined;
 
-function startWidgetTimers(): void {
+function startWidgetTimers(deferNetwork = false): void {
   window.clearInterval(priceTimer);
   window.clearInterval(newsTimer);
   window.clearInterval(weatherTimer);
@@ -856,17 +1040,41 @@ function startWidgetTimers(): void {
   if (priceWidget) priceWidget.hidden = !settings?.widgets.priceTicker;
   if (newsSection) newsSection.hidden = !settings?.widgets.newsWidget;
 
-  if (settings?.widgets.priceTicker) {
-    void updatePrices();
-    priceTimer = window.setInterval(() => void updatePrices(), INTERVALS.prices);
-  }
-  if (settings?.widgets.newsWidget) {
-    void updateNews();
-    newsTimer = window.setInterval(() => void updateNews(), INTERVALS.news);
-  }
-  if (showWeather) {
-    void updateHeroWeather();
-    weatherTimer = window.setInterval(() => void updateHeroWeather(), 20 * 60 * 1000);
+  const hydrateAll = (): void => {
+    if (settings?.widgets.priceTicker) {
+      void updatePrices();
+      priceTimer = window.setInterval(() => void updatePrices(true), INTERVALS.prices);
+    }
+    if (settings?.widgets.newsWidget) {
+      void updateNews();
+      newsTimer = window.setInterval(() => void updateNews(true), INTERVALS.news);
+    }
+    if (showWeather) {
+      void updateHeroWeather();
+      weatherTimer = window.setInterval(() => void updateHeroWeather(true), 20 * 60 * 1000);
+    }
+  };
+
+  if (deferNetwork) {
+    // Paint any local cached values immediately; defer stale network calls until browser is idle
+    if (showWeather) {
+      void getCachedWeather(settings.weather).then((c) => {
+        if (c.data) renderHeroWeather(c.data);
+      });
+    }
+    if (settings?.widgets.priceTicker) {
+      void ApiClient.getCachedPrices(['usd', 'gold']).then((c) => {
+        if (c.data.usd || c.data.gold) renderPriceMetrics(c.data, false);
+      });
+    }
+    if (settings?.widgets.newsWidget) {
+      void ApiClient.getCachedNews(settings.news).then((c) => {
+        if (c.article) renderNewsArticle(c.article);
+      });
+    }
+    scheduleIdle(hydrateAll, 250);
+  } else {
+    hydrateAll();
   }
 }
 
@@ -893,7 +1101,7 @@ document.getElementById('nav-scratchpad-btn')?.addEventListener('click', () => {
 });
 
 document.getElementById('nav-settings-btn')?.addEventListener('click', () => {
-  void settingsUI?.open('general');
+  void openSettingsModal('general');
 });
 
 // --- Global Keyboard Navigation ---
@@ -968,10 +1176,33 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// --- Boot ---
+// --- Boot (Instant First Paint: 1 batched storage read, lazy deck & settings, deferred telemetry) ---
 (async function boot(): Promise<void> {
-  settings = await storage.getSettings();
+  const snapshot = await storage.getMany([
+    STORAGE_KEYS.settings,
+    STORAGE_KEYS.shortcuts,
+    FOCUS_STORAGE_KEY,
+    STORAGE_KEYS.stickyNotes,
+    STORAGE_KEYS.notesVisible,
+    STORAGE_KEYS.drawerOpen
+  ]);
+
+  settings = storage.parseSettings(snapshot[STORAGE_KEYS.settings]);
   applyTheme(settings);
+  startClock();
+
+  // Render bookmarks FIRST so they are immediately interactive
+  const rawShortcuts = snapshot[STORAGE_KEYS.shortcuts] as Shortcut[] | undefined;
+  if (rawShortcuts === undefined) {
+    shortcutsCache = STARTER_SHORTCUTS.map((s) => ({ ...s }));
+    void storage.setShortcuts(shortcutsCache);
+  } else {
+    shortcutsCache = rawShortcuts;
+  }
+  renderShortcuts(shortcutsCache);
+
+  // Hydrate Daily Focus from batched snapshot (zero extra storage IPC)
+  void initHeroFocus(snapshot[FOCUS_STORAGE_KEY] as FocusData | undefined);
 
   const persistSettings = async (updated: Settings): Promise<void> => {
     const prevTheme = settings?.appearance.themePreset;
@@ -981,49 +1212,19 @@ document.addEventListener('keydown', (e) => {
     applyTheme(updated);
     settingsUI?.syncExternal(updated);
     startClock();
-    startWidgetTimers();
+    startWidgetTimers(false);
     if (prevTheme !== updated.appearance.themePreset || prevIconStyle !== updated.appearance.bookmarkIconStyle) {
       renderShortcuts(shortcutsCache);
     }
-    await deckGrid?.refresh();
+    if (deckInitialized && drawerOpen) {
+      await deckGrid?.refresh();
+    } else {
+      deckNeedsRefresh = true;
+    }
   };
+  persistSettingsFn = persistSettings;
 
-  // Register the 4 confirmed live hardware modules
-  registry.register(
-    createFinanceWidget({
-      getSettings: () => settings,
-      onUpdateAlerts: async (alerts) => {
-        const next = structuredClone(settings);
-        next.finance.alerts = alerts;
-        await persistSettings(next);
-      }
-    })
-  );
-
-  registry.register(
-    createWeatherWidget({
-      getSettings: () => settings,
-      onUpdateLocation: async (loc) => {
-        const next = structuredClone(settings);
-        next.weather = { ...loc, unit: next.weather.unit ?? 'c' };
-        await persistSettings(next);
-      }
-    })
-  );
-
-  registry.register(createCalendarWidget({ getSettings: () => settings }));
-  registry.register(createRssWidget());
-
-  // Initialize Modular Workspace Deck
-  const bentoContainer = document.getElementById('bento-container')!;
-  const deckShelf = document.getElementById('deck-shelf');
-  deckGrid = new BentoGrid({
-    container: bentoContainer,
-    shelfContainer: deckShelf
-  });
-  await deckGrid.init();
-
-  // Initialize Spatial Scratchpad
+  // Initialize Spatial Scratchpad with preloaded state (zero extra storage reads, tray built lazily on open)
   scratchpad = new SpatialScratchpad({
     canvasEl: document.getElementById('notes-container')!,
     trayEl: document.getElementById('scratchpad-tray')!,
@@ -1033,7 +1234,10 @@ document.addEventListener('keydown', (e) => {
       if (labelEl) labelEl.textContent = count > 0 ? `SCRATCH_PAD (${count})` : 'SCRATCH_PAD';
     }
   });
-  await scratchpad.init();
+  await scratchpad.init({
+    notes: (snapshot[STORAGE_KEYS.stickyNotes] as NoteData[] | undefined) ?? [],
+    visible: (snapshot[STORAGE_KEYS.notesVisible] as boolean | undefined) ?? true
+  });
 
   // Register Power Command Actions
   actionRegistry.register({
@@ -1065,7 +1269,7 @@ document.addEventListener('keydown', (e) => {
   actionRegistry.register({
     name: 'Open Preferences',
     aliases: ['settings', 'config', 'bangs'],
-    run: () => void settingsUI?.open('general')
+    run: () => void openSettingsModal('general')
   });
   actionRegistry.register({
     name: 'Toggle Jalali / Gregorian Calendar',
@@ -1083,7 +1287,6 @@ document.addEventListener('keydown', (e) => {
     run: () => scratchpad?.exportMarkdown()
   });
 
-  // Register instant theme switching commands for every preset
   for (const preset of THEME_PRESETS) {
     actionRegistry.register({
       name: `Theme: ${preset.name}`,
@@ -1103,22 +1306,11 @@ document.addEventListener('keydown', (e) => {
     onCopy: (label) => showToast(label)
   });
 
-  settingsUI = await SettingsUI.init({
-    onChange: async (updated) => {
-      await persistSettings(updated);
-    },
-    onModulesChange: async () => {
-      await deckGrid?.refresh();
-    },
-    onToast: (msg) => showToast(msg)
-  });
-
-  if (settings.general.rememberDrawerState) {
-    const savedOpen = await storage.getDrawerOpen();
-    if (savedOpen) setDrawerOpen(true, false);
+  // Only mount Workspace Deck on boot if user explicitly chose to remember an open drawer
+  if (settings.general.rememberDrawerState && snapshot[STORAGE_KEYS.drawerOpen] === true) {
+    setDrawerOpen(true, false);
   }
 
-  startClock();
-  await Promise.all([loadShortcuts(), initHeroFocus()]);
-  startWidgetTimers();
+  // Paint cached right-pane telemetry immediately and defer any stale network calls until idle
+  startWidgetTimers(true);
 })();

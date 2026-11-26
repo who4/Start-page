@@ -215,14 +215,117 @@ function findMatchingKeyword(item: RssFeedItem, keywords: string[]): string | nu
   return null;
 }
 
+const PRICE_CACHE_STORAGE_KEY = 'priceCacheV2';
+const NEWS_CACHE_STORAGE_KEY = 'newsCacheV2';
+const NEWS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+interface CachedNewsEntry {
+  key: string;
+  article: NewsArticle;
+  timestamp: number;
+}
+
+function newsCacheKey(newsSettings?: NewsSettings): string {
+  const sourceId = newsSettings?.sourceId || 'bbc-world';
+  const customUrl = (newsSettings?.customUrl || '').trim();
+  const keywords = (newsSettings?.keywords || [])
+    .map((k) => k.trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  return `${sourceId}|${customUrl}|${keywords}`;
+}
+
 export class ApiClient {
   private static suggestController: AbortController | null = null;
 
-  // In-memory cache — one fetch cycle per tab per interval even with re-renders.
+  // In-memory + persistent chrome.storage.local cache
   private static priceCache: Map<FinanceAssetId, CachedPrice> = new Map();
+  private static priceCacheHydrated = false;
+  private static inflightPrice: Map<FinanceAssetId, Promise<PriceData>> = new Map();
+  private static inflightNews: Map<string, Promise<NewsArticle | null>> = new Map();
 
   static clearPriceCache(): void {
     this.priceCache.clear();
+    try {
+      chrome.storage.local.remove([PRICE_CACHE_STORAGE_KEY]);
+    } catch {
+      // ignore
+    }
+  }
+
+  private static async hydratePriceCache(): Promise<void> {
+    if (this.priceCacheHydrated) return;
+    this.priceCacheHydrated = true;
+    try {
+      const stored = await new Promise<Record<string, CachedPrice> | undefined>((resolve) => {
+        chrome.storage.local.get([PRICE_CACHE_STORAGE_KEY], (r) =>
+          resolve((r as Record<string, Record<string, CachedPrice>>)[PRICE_CACHE_STORAGE_KEY])
+        );
+      });
+      if (stored && typeof stored === 'object') {
+        for (const [k, v] of Object.entries(stored)) {
+          if (v && v.value && typeof v.timestamp === 'number') {
+            this.priceCache.set(k as FinanceAssetId, v);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private static persistPriceCache(): void {
+    try {
+      const obj: Record<string, CachedPrice> = {};
+      for (const [k, v] of this.priceCache.entries()) {
+        obj[k] = v;
+      }
+      chrome.storage.local.set({ [PRICE_CACHE_STORAGE_KEY]: obj });
+    } catch {
+      // ignore
+    }
+  }
+
+  static async getCachedPrices(
+    assetIds: FinanceAssetId[] = ['usd', 'gold']
+  ): Promise<{ data: Partial<Record<FinanceAssetId, PriceData>>; fresh: boolean }> {
+    await this.hydratePriceCache();
+    const data: Partial<Record<FinanceAssetId, PriceData>> = {};
+    let fresh = true;
+    const now = Date.now();
+    for (const id of assetIds) {
+      const entry = this.priceCache.get(id);
+      if (entry) {
+        data[id] = entry.value;
+        if (now - entry.timestamp >= INTERVALS.priceCache) fresh = false;
+      } else {
+        fresh = false;
+      }
+    }
+    return { data, fresh };
+  }
+
+  static async getCachedNews(
+    newsSettings?: NewsSettings
+  ): Promise<{ article: NewsArticle | null; fresh: boolean }> {
+    const key = newsCacheKey(newsSettings);
+    try {
+      const stored = await new Promise<CachedNewsEntry | undefined>((resolve) => {
+        chrome.storage.local.get([NEWS_CACHE_STORAGE_KEY], (r) =>
+          resolve((r as Record<string, CachedNewsEntry>)[NEWS_CACHE_STORAGE_KEY])
+        );
+      });
+      if (stored && stored.key === key && stored.article) {
+        return {
+          article: stored.article,
+          fresh: Date.now() - stored.timestamp < NEWS_CACHE_TTL_MS
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return { article: null, fresh: false };
   }
 
   // --- Helper: Fetch via Background Script ---
@@ -310,7 +413,32 @@ export class ApiClient {
 
   // --- News ---
 
-  static async fetchNews(newsSettings?: NewsSettings): Promise<NewsArticle | null> {
+  static async fetchNews(newsSettings?: NewsSettings, forceRefresh = false): Promise<NewsArticle | null> {
+    const cacheKey = newsCacheKey(newsSettings);
+
+    if (!forceRefresh) {
+      const cached = await this.getCachedNews(newsSettings);
+      if (cached.fresh && cached.article) {
+        return cached.article;
+      }
+    }
+
+    const pending = this.inflightNews.get(cacheKey);
+    if (pending) return pending;
+
+    const task = this.fetchNewsNetwork(newsSettings, cacheKey);
+    this.inflightNews.set(cacheKey, task);
+    try {
+      return await task;
+    } finally {
+      this.inflightNews.delete(cacheKey);
+    }
+  }
+
+  private static async fetchNewsNetwork(
+    newsSettings: NewsSettings | undefined,
+    cacheKey: string
+  ): Promise<NewsArticle | null> {
     const sourceId = newsSettings?.sourceId || 'bbc-world';
     const keywords = (newsSettings?.keywords || [])
       .map((k) => k.trim())
@@ -339,6 +467,17 @@ export class ApiClient {
       sourceDomain = source.domain;
       fallbackSiteUrl = source.siteUrl;
     }
+
+    const persistNews = (article: NewsArticle): NewsArticle => {
+      try {
+        chrome.storage.local.set({
+          [NEWS_CACHE_STORAGE_KEY]: { key: cacheKey, article, timestamp: Date.now() } as CachedNewsEntry
+        });
+      } catch {
+        // ignore
+      }
+      return article;
+    };
 
     const pickFromItems = (items: RssFeedItem[]): NewsArticle | null => {
       if (items.length === 0) return null;
@@ -372,7 +511,7 @@ export class ApiClient {
     try {
       const feed = await this.fetchRssFeed(feedUrl);
       const picked = pickFromItems(feed.items);
-      if (picked) return picked;
+      if (picked) return persistNews(picked);
 
       // If keywords were set and a small RSS feed had no match, query Google News
       // scoped to this source domain + keywords (skip for direct JSON breaking feeds like Iran Monitor
@@ -388,20 +527,20 @@ export class ApiClient {
         )}&hl=en-US&gl=US&ceid=US:en`;
         const scopedFeed = await this.fetchRssFeed(scopedUrl);
         const scopedPick = pickFromItems(scopedFeed.items);
-        if (scopedPick) return scopedPick;
+        if (scopedPick) return persistNews(scopedPick);
       }
     } catch (e) {
       console.warn('News Fetch Failed', e);
     }
 
     if (keywords.length > 0) {
-      return {
+      return persistNews({
         title: `No headlines matching: ${keywords.join(', ')}`,
         url: fallbackSiteUrl,
         sourceName,
         sourceDomain,
         noKeywordMatch: true
-      };
+      });
     }
 
     if (fallbackSiteUrl) {
@@ -454,34 +593,54 @@ export class ApiClient {
   //   3. TGJU profile page scrape (heavy fallback)
   //   4. brsapi free endpoint
 
-  static async fetchPrices(): Promise<Record<FinanceAssetId, PriceData>> {
-    const ids = Object.keys(FINANCE_ASSETS) as FinanceAssetId[];
+  static async fetchPrices(
+    assetIds?: FinanceAssetId[]
+  ): Promise<Record<FinanceAssetId, PriceData>> {
+    const ids = assetIds && assetIds.length > 0 ? assetIds : (Object.keys(FINANCE_ASSETS) as FinanceAssetId[]);
     const results = await Promise.all(ids.map((id) => this.fetchAssetPrice(id)));
     const out = {} as Record<FinanceAssetId, PriceData>;
-    ids.forEach((id, i) => { out[id] = results[i]; });
+    ids.forEach((id, i) => {
+      out[id] = results[i];
+    });
     return out;
   }
 
   static async fetchAssetPrice(asset: FinanceAssetId): Promise<PriceData> {
+    await this.hydratePriceCache();
     const cached = this.priceCache.get(asset);
     if (cached && Date.now() - cached.timestamp < INTERVALS.priceCache) {
       return cached.value;
     }
 
-    const jsonResult = await this.fetchTgjuJson(asset).catch(() => null);
-    let result: PriceData = jsonResult ?? { price: 'Error', trend: 'flat' };
+    const pending = this.inflightPrice.get(asset);
+    if (pending) return pending;
 
-    if (result.price === 'Error' && (asset === 'usd' || asset === 'gold')) {
-      result = await this.fetchProfileData(asset === 'usd' ? API_URLS.dollarProfile : API_URLS.goldProfile);
-    }
-    if (result.price === 'Error') {
-      result = await this.fetchBrsAsset(asset);
-    }
+    const task = (async (): Promise<PriceData> => {
+      const jsonResult = await this.fetchTgjuJson(asset).catch(() => null);
+      let result: PriceData = jsonResult ?? { price: 'Error', trend: 'flat' };
 
-    if (result.price !== 'Error') {
-      this.priceCache.set(asset, { value: result, timestamp: Date.now() });
+      if (result.price === 'Error' && (asset === 'usd' || asset === 'gold')) {
+        result = await this.fetchProfileData(
+          asset === 'usd' ? API_URLS.dollarProfile : API_URLS.goldProfile
+        );
+      }
+      if (result.price === 'Error') {
+        result = await this.fetchBrsAsset(asset);
+      }
+
+      if (result.price !== 'Error') {
+        this.priceCache.set(asset, { value: result, timestamp: Date.now() });
+        this.persistPriceCache();
+      }
+      return result;
+    })();
+
+    this.inflightPrice.set(asset, task);
+    try {
+      return await task;
+    } finally {
+      this.inflightPrice.delete(asset);
     }
-    return result;
   }
 
   private static async fetchTgjuJson(asset: FinanceAssetId): Promise<PriceData> {

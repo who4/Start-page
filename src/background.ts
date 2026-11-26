@@ -52,14 +52,59 @@ function extractFirstIconFromHtml(html: string, baseUrl: string): string[] {
   return Array.from(new Set(scored.map((s) => s.url))).slice(0, 4);
 }
 
+const DIRECT_APP_ICONS: Record<string, string> = {
+  'mail.google.com': 'https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico',
+  'drive.google.com': 'https://ssl.gstatic.com/images/branding/product/2x/drive_2020q4_48dp.png',
+  'calendar.google.com': 'https://calendar.google.com/googlecalendar/images/favicons_2020q4/calendar_31.ico',
+  'docs.google.com': 'https://ssl.gstatic.com/docs/documents/images/kix-favicon7.ico'
+};
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 5000
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readHtmlHead(resp: Response, maxBytes = 36_000): Promise<string> {
+  if (!resp.body) {
+    return (await resp.text()).slice(0, maxBytes);
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let text = '';
+  let bytesRead = 0;
+  try {
+    while (bytesRead < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      bytesRead += value.byteLength;
+      text += decoder.decode(value, { stream: true });
+      if (/<\/head>/i.test(text)) break;
+    }
+  } catch {
+    // ignore partial stream abort
+  } finally {
+    reader.cancel().catch(() => undefined);
+  }
+  return text;
+}
+
 async function fetchImageAsDataUrl(url: string): Promise<string | null> {
   try {
-    const resp = await fetch(url, { redirect: 'follow' });
+    const resp = await fetchWithTimeout(url, { redirect: 'follow' }, 3500);
     if (!resp.ok) return null;
     const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html')) return null;
     const blob = await resp.blob();
     if (blob.size < 60 || blob.size > 1_500_000) return null;
-    if (ct.includes('text/html')) return null;
     return await new Promise<string | null>((resolve) => {
       const reader = new FileReader();
       reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
@@ -77,7 +122,7 @@ const handlers: Record<string, Handler> = {
     const generation = ++suggestionGeneration;
     const targetUrl = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`;
 
-    fetch(targetUrl)
+    fetchWithTimeout(targetUrl, {}, 3500)
       .then((response) => response.json())
       .then((data: unknown[]) => {
         if (generation !== suggestionGeneration) return;
@@ -122,7 +167,7 @@ const handlers: Record<string, Handler> = {
       return;
     }
 
-    fetch(url)
+    fetchWithTimeout(url, {}, 5500)
       .then(async (response) => {
         if (!response.ok) throw new Error(response.statusText);
         const text = await response.text();
@@ -148,12 +193,16 @@ const handlers: Record<string, Handler> = {
       return;
     }
 
-    fetch(url, {
-      redirect: 'follow',
-      headers: {
-        Accept: 'application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
-      }
-    })
+    fetchWithTimeout(
+      url,
+      {
+        redirect: 'follow',
+        headers: {
+          Accept: 'application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8'
+        }
+      },
+      6000
+    )
       .then(async (response) => {
         if (!response.ok) throw new Error(response.statusText);
         const text = await response.text();
@@ -169,15 +218,25 @@ const handlers: Record<string, Handler> = {
     const clean = (domain || '').trim().toLowerCase();
 
     (async () => {
-      // 1. Direct HTML icon discovery from the website itself
+      // 0. Instant direct icon for Google Workspace web apps (avoids accounts.google.com redirect)
+      const directAppIcon = DIRECT_APP_ICONS[clean];
+      if (directAppIcon) {
+        const dataUrl = await fetchImageAsDataUrl(directAppIcon);
+        if (dataUrl) {
+          sendResponse({ success: true, data: dataUrl } as SuccessResponse<string>);
+          return;
+        }
+      }
+
+      // 1. Direct HTML <head> icon discovery (stops streaming immediately after </head>)
       try {
-        const pageResp = await fetch(`https://${clean}/`, { redirect: 'follow' });
+        const pageResp = await fetchWithTimeout(`https://${clean}/`, { redirect: 'follow' }, 3500);
         if (pageResp.ok) {
           const finalHost = new URL(pageResp.url).hostname.replace(/^www\./, '').toLowerCase();
           const baseHost = clean.replace(/^www\./, '').toLowerCase();
           const isAuthRedirect = /^(accounts|login|signin|auth)\./.test(finalHost) && finalHost !== baseHost;
           if (!isAuthRedirect) {
-            const html = (await pageResp.text()).slice(0, 60000);
+            const html = await readHtmlHead(pageResp, 36_000);
             const links = extractFirstIconFromHtml(html, pageResp.url);
             for (const link of links) {
               const dataUrl = await fetchImageAsDataUrl(link);
@@ -186,6 +245,8 @@ const handlers: Record<string, Handler> = {
                 return;
               }
             }
+          } else {
+            pageResp.body?.cancel().catch(() => undefined);
           }
         }
       } catch {

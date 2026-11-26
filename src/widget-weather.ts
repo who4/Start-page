@@ -502,6 +502,40 @@ function weatherGlyphSvg(code: number): string {
   return '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M7 14h10a3.5 3.5 0 0 0 .4-7 5 5 0 0 0-9.6-1A3.2 3.2 0 0 0 7 14Z"/><path d="M9 17.5l-1 3M13 17.5l-1 3M17 17.5l-1 3" stroke-linecap="round"/></svg>';
 }
 
+const inflightWeather = new Map<string, Promise<WeatherSnapshot | null>>();
+
+export async function getCachedWeather(
+  loc: WeatherLocation
+): Promise<{ data: WeatherSnapshot | null; fresh: boolean }> {
+  const cacheKey = `${loc.lat.toFixed(2)},${loc.lon.toFixed(2)}`;
+  try {
+    const stored = await new Promise<WeatherSnapshot | undefined>((resolve) => {
+      chrome.storage.local.get([STORAGE_KEY], (r) =>
+        resolve((r as Record<string, WeatherSnapshot>)[STORAGE_KEY])
+      );
+    });
+    if (stored && (loc.useGeolocation || stored.key === cacheKey)) {
+      return {
+        data: { ...stored, city: loc.useGeolocation ? stored.city : loc.city },
+        fresh: Date.now() - stored.fetchedAt < CACHE_TTL
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return { data: null, fresh: false };
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export async function fetchWeatherData(
   loc: WeatherLocation,
   forceRefresh = false
@@ -527,7 +561,9 @@ export async function fetchWeatherData(
   if (!forceRefresh) {
     try {
       const stored = await new Promise<WeatherSnapshot | undefined>((resolve) => {
-        chrome.storage.local.get([STORAGE_KEY], (r) => resolve((r as Record<string, WeatherSnapshot>)[STORAGE_KEY]));
+        chrome.storage.local.get([STORAGE_KEY], (r) =>
+          resolve((r as Record<string, WeatherSnapshot>)[STORAGE_KEY])
+        );
       });
       if (stored && stored.key === cacheKey && Date.now() - stored.fetchedAt < CACHE_TTL) {
         return { ...stored, city };
@@ -537,48 +573,63 @@ export async function fetchWeatherData(
     }
   }
 
-  try {
-    const [weatherResp, aqiResp] = await Promise.all([
-      fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1`
-      ),
-      fetch(
-        `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=european_aqi`
-      )
-    ]);
+  const inflightKey = `${cacheKey}:${forceRefresh ? '1' : '0'}`;
+  const existing = inflightWeather.get(inflightKey);
+  if (existing) return existing;
 
-    if (!weatherResp.ok) return null;
-    const weather = await weatherResp.json();
-    const aqiData = aqiResp.ok ? await aqiResp.json() : {};
-
-    const current = weather.current;
-    const daily = weather.daily;
-    const aqi = Math.round(aqiData.current?.european_aqi ?? 0);
-
-    const cache: WeatherSnapshot = {
-      key: cacheKey,
-      city,
-      temp: Math.round(current.temperature_2m),
-      feelsLike: Math.round(current.apparent_temperature ?? current.temperature_2m),
-      windKmh: Math.round(current.wind_speed_10m ?? 0),
-      code: current.weather_code,
-      condition: WMO_CODES[current.weather_code] || 'Clear',
-      aqi,
-      aqiLabel: aqiDescriptor(aqi).label,
-      high: Math.round(daily.temperature_2m_max[0]),
-      low: Math.round(daily.temperature_2m_min[0]),
-      fetchedAt: Date.now()
-    };
-
+  const task = (async (): Promise<WeatherSnapshot | null> => {
     try {
-      chrome.storage.local.set({ [STORAGE_KEY]: cache });
-    } catch {
-      // ignore
-    }
+      const [weatherResp, aqiResp] = await Promise.all([
+        fetchJsonWithTimeout(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1`,
+          5000
+        ),
+        fetchJsonWithTimeout(
+          `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=european_aqi`,
+          5000
+        )
+      ]);
 
-    return cache;
-  } catch {
-    return null;
+      if (!weatherResp.ok) return null;
+      const weather = await weatherResp.json();
+      const aqiData = aqiResp.ok ? await aqiResp.json() : {};
+
+      const current = weather.current;
+      const daily = weather.daily;
+      const aqi = Math.round(aqiData.current?.european_aqi ?? 0);
+
+      const cache: WeatherSnapshot = {
+        key: cacheKey,
+        city,
+        temp: Math.round(current.temperature_2m),
+        feelsLike: Math.round(current.apparent_temperature ?? current.temperature_2m),
+        windKmh: Math.round(current.wind_speed_10m ?? 0),
+        code: current.weather_code,
+        condition: WMO_CODES[current.weather_code] || 'Clear',
+        aqi,
+        aqiLabel: aqiDescriptor(aqi).label,
+        high: Math.round(daily.temperature_2m_max[0]),
+        low: Math.round(daily.temperature_2m_min[0]),
+        fetchedAt: Date.now()
+      };
+
+      try {
+        chrome.storage.local.set({ [STORAGE_KEY]: cache });
+      } catch {
+        // ignore
+      }
+
+      return cache;
+    } catch {
+      return null;
+    }
+  })();
+
+  inflightWeather.set(inflightKey, task);
+  try {
+    return await task;
+  } finally {
+    inflightWeather.delete(inflightKey);
   }
 }
 

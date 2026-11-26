@@ -85,6 +85,22 @@ type ChangeListener = (changes: Record<string, unknown>, area: string) => void;
 class StorageService {
   private listeners: Set<ChangeListener> = new Set();
 
+  getMany(keys: string[]): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.storage.local.get(keys, (result) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve((result as Record<string, unknown>) || {});
+        });
+      } catch (e) {
+        reject(e as Error);
+      }
+    });
+  }
+
   get<T>(key: string): Promise<T | undefined>;
   get<T>(key: string, fallback: T): Promise<T>;
   async get<T>(key: string, fallback?: T): Promise<T | undefined> {
@@ -166,8 +182,7 @@ class StorageService {
     await this.set(STORAGE_KEYS.notesVisible, visible);
   }
 
-  async getSettings(): Promise<Settings> {
-    const raw = await this.get<unknown>(STORAGE_KEYS.settings);
+  parseSettings(raw: unknown): Settings {
     const merged = mergeWithDefaults(DEFAULT_SETTINGS, raw);
     // Migrate legacy preset/icon values
     if ((merged.appearance.themePreset as string) === 'midnight') {
@@ -177,6 +192,11 @@ class StorageService {
       merged.appearance.bookmarkIconStyle = 'solid';
     }
     return merged;
+  }
+
+  async getSettings(): Promise<Settings> {
+    const raw = await this.get<unknown>(STORAGE_KEYS.settings);
+    return this.parseSettings(raw);
   }
 
   async saveSettings(settings: Settings): Promise<void> {

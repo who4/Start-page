@@ -229,6 +229,8 @@ export class BentoGrid {
       return;
     }
 
+    const renderTasks: Array<Promise<void>> = [];
+
     for (const entry of enabled) {
       const def = registry.get(entry.id);
       if (!def) continue;
@@ -254,12 +256,16 @@ export class BentoGrid {
       this.gridEl.appendChild(slot);
       this.activeWidgets.set(entry.id, { def, container: body });
 
-      try {
-        await def.render(body);
-      } catch (e) {
-        console.warn(`Widget "${entry.id}" render error:`, e);
-      }
+      renderTasks.push(
+        Promise.resolve()
+          .then(() => def.render(body))
+          .catch((e) => {
+            console.warn(`Widget "${entry.id}" render error:`, e);
+          })
+      );
     }
+
+    await Promise.all(renderTasks);
   }
 
   private attachCustomizeControls(slot: HTMLElement, entry: WidgetEntry, def: WidgetDef): void {

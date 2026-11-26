@@ -29,12 +29,13 @@ export class SpatialScratchpad {
 
   constructor(private deps: ScratchpadDeps) {}
 
-  async init(): Promise<void> {
-    this.notes = await storage.getNotes();
-    this.visible = await storage.getNotesVisible();
+  async init(preloaded?: { notes?: NoteData[]; visible?: boolean }): Promise<void> {
+    this.notes = preloaded?.notes ?? (await storage.getNotes());
+    this.visible = preloaded?.visible ?? (await storage.getNotesVisible());
     this.applyVisibility();
-    this.renderAllCards();
-    this.renderTray();
+    if (this.notes.length > 0) {
+      this.renderAllCards();
+    }
     this.deps.onCountChange?.(this.notes.length);
 
     chrome.storage.onChanged.addListener((changes, area) => {
