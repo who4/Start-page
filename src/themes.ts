@@ -126,21 +126,14 @@ export function applyTheme(settings: Settings): void {
     root.style.removeProperty('--bg-canvas');
   }
 
-  updatePageFavicon(
-    customBg && /^#[0-9a-fA-F]{6}$/.test(customBg) ? customBg : preset.previewSwatches[0],
-    preset.mode === 'light' ? '#18191B' : '#FFFFFF',
-    customAccent && /^#[0-9a-fA-F]{6}$/.test(customAccent) ? customAccent : preset.accent,
-    preset.mode === 'light' ? 'rgba(24,25,27,0.24)' : 'rgba(255,255,255,0.22)'
-  );
+  updatePageFavicon(preset.mode === 'light' ? '#18191B' : '#E8E8EC');
 }
 
-function updatePageFavicon(bg: string, ink: string, accent: string, border: string): void {
+function updatePageFavicon(ink: string): void {
   if (typeof document === 'undefined') return;
   const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">` +
-    `<rect x="2" y="2" width="60" height="60" fill="${bg}" stroke="${border}" stroke-width="3"/>` +
-    `<path d="M14 31 L32 16 L50 31 V49 H37 V37 H27 V49 H14 Z" fill="none" stroke="${ink}" stroke-width="3.6" stroke-linejoin="miter"/>` +
-    `<rect x="29" y="40" width="6" height="9" fill="${accent}"/>` +
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">` +
+    `<path d="M12 3.2L3 10.6V20.5h6.4v-6.2h5.2v6.2H21V10.6L12 3.2z" fill="${ink}"/>` +
     `</svg>`;
   const href = `data:image/svg+xml,${encodeURIComponent(svg)}`;
   let link = document.getElementById('page-favicon') as HTMLLinkElement | null;
