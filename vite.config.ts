@@ -17,7 +17,8 @@ const manifest = defineManifest({
     '*://geocoding-api.open-meteo.com/*',
     '*://photon.komoot.io/*',
     '*://nominatim.openstreetmap.org/*',
-    '*://icons.duckduckgo.com/*'
+    '*://icons.duckduckgo.com/*',
+    '*://*.gstatic.com/*'
   ],
   background: {
     service_worker: 'src/background.ts'
@@ -405,6 +406,7 @@ export default defineConfig(({ mode }) => {
     return {
       plugins: [crx({ manifest })],
       build: {
+        outDir: 'extension',
         emptyOutDir: true
       }
     };

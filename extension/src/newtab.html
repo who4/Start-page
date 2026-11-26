@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="graphite" data-color-scheme="dark">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System Terminal — Start</title>
+  <meta name="description" content="A minimalist three-pane terminal start page with a power command bar, modular workspace deck, spatial scratchpad, and live weather, market, calendar, and RSS modules.">
+  <meta property="og:title" content="System Terminal — Start">
+  <meta property="og:description" content="A minimalist three-pane terminal start page with a power command bar, modular workspace deck, spatial scratchpad, and live modules.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;700&family=Geist:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script type="module" crossorigin src="/assets/newtab.html-CG4ylNuq.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/constants-DFvyKwMg.js">
+  <link rel="stylesheet" crossorigin href="/assets/newtab-BJeK_fVO.css">
+</head>
+
+<body>
+  <!-- Spatial Scratchpad Floating Canvas -->
+  <div id="notes-container" aria-label="Spatial scratchpad notes"></div>
+
+  <!-- LEFT PANE: BOOKMARKS & DAILY FOCUS -->
+  <aside class="pane pane-left" aria-label="Navigation and shortcuts">
+    <div class="pane-section-head">
+      <div class="pane-label">Bookmarks</div>
+      <button type="button" class="add-shortcut-btn" id="add-shortcut-trigger" title="Add Shortcut" aria-label="Add Shortcut">+ ADD</button>
+    </div>
+
+    <nav class="shortcuts-grid" id="shortcuts-grid" aria-label="Shortcuts"></nav>
+
+    <div class="left-bottom-block">
+      <div class="pane-label">Daily.Focus</div>
+      <div class="hero-focus">
+        <button type="button" class="focus-toggle-btn" id="focus-toggle-btn" aria-pressed="false" title="Toggle focus complete">[ ]</button>
+        <input
+          type="text"
+          id="focus-input"
+          class="focus-input"
+          placeholder="Set focus for today..."
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Daily focus intention"
+        >
+      </div>
+    </div>
+  </aside>
+
+  <!-- CENTER PANE: CLOCK, COMMAND BAR & BOTTOM CONTROLS -->
+  <main class="pane center-pane" id="hero-stage">
+    <div class="center-main">
+      <div class="clock" id="time-display">00:00:00</div>
+      <div class="date" id="date-display">Loading date...</div>
+
+      <div class="cmd-input-wrap search-container" aria-label="Command bar">
+        <div class="command-slot">
+          <span class="command-mode-indicator" id="command-mode-indicator" aria-hidden="true">&gt;</span>
+          <input
+            type="text"
+            id="search-input"
+            class="cmd-input"
+            placeholder="Search..."
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Search or enter a command"
+            aria-autocomplete="list"
+            aria-controls="search-suggestions"
+          >
+          <kbd class="command-slash-hint" aria-hidden="true">/</kbd>
+        </div>
+        <div id="search-suggestions" class="suggestions-container" role="listbox" aria-label="Command results"></div>
+      </div>
+    </div>
+
+    <div class="pill-container" role="toolbar" aria-label="Workspace controls">
+      <button type="button" class="pill deck-handle" id="deck-handle-btn" aria-expanded="false" aria-controls="workspace-drawer">WORKSPACE_DECK</button>
+      <button type="button" class="pill dock-key-btn" id="nav-scratchpad-btn" aria-expanded="false" aria-controls="scratchpad-tray" title="Open Scratchpad (Cmd/Ctrl+.)">
+        <span id="scratchpad-btn-label">SCRATCH_PAD</span>
+      </button>
+    </div>
+  </main>
+
+  <!-- RIGHT PANE: LIVE ATMOSPHERE, MARKETS, WIRE & SETTINGS -->
+  <aside class="pane pane-right" aria-label="Live telemetry">
+    <div class="data-grid">
+      <section class="telemetry-block telemetry-block--interactive" id="hero-weather" role="button" tabindex="0" title="Open Atmosphere module in Workspace Deck">
+        <div class="pane-label">Atmosphere</div>
+        <div class="big-num" id="hero-weather-temp">--°C</div>
+        <div class="data-sublabel" id="hero-weather-meta">Reading local weather...</div>
+        <span class="price-item" id="hero-weather-aqi"></span>
+      </section>
+
+      <section class="telemetry-block telemetry-block--interactive" id="price-widget" role="button" tabindex="0" title="Open Market Pulse in Workspace Deck">
+        <div class="pane-label">Market.Volatility</div>
+        <div class="big-num" id="price-usd-big">---</div>
+        <div class="data-sublabel">USD / Toman Exchange</div>
+        <span class="price-item" id="price-usd">USD —</span>
+        <span class="price-item" id="price-gold">GOLD —</span>
+      </section>
+
+      <section class="telemetry-block">
+        <div class="pane-label">Live Wire</div>
+        <a class="news-wire-link news-widget--inert" id="news-widget" target="_blank" rel="noopener noreferrer">
+          <p class="news-p" id="news-headline">Fetching latest headline...</p>
+        </a>
+      </section>
+    </div>
+
+    <div class="right-bottom-actions">
+      <button type="button" class="pill settings-icon-btn" id="nav-settings-btn" title="Settings &amp; Themes" aria-label="Open Settings">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+        </svg>
+        <span>SETTINGS</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Toggleable Modular Workspace Drawer -->
+  <div class="drawer-backdrop" id="drawer-backdrop" aria-hidden="true"></div>
+  <aside class="workspace-drawer" id="workspace-drawer" aria-label="Modular Workspace Deck" aria-hidden="true">
+    <div class="drawer-header">
+      <div class="drawer-title-group">
+        <h2 class="drawer-title">Workspace Deck</h2>
+      </div>
+
+      <div class="drawer-actions">
+        <button type="button" class="hw-btn" id="drawer-customize-btn">Customize</button>
+        <button type="button" class="hw-mini-btn" id="drawer-close-btn" aria-label="Close Workspace Deck">×</button>
+      </div>
+    </div>
+
+    <div class="deck-shelf" id="deck-shelf" hidden></div>
+    <div class="drawer-scroll">
+      <div id="bento-container" class="bento-container"></div>
+    </div>
+  </aside>
+
+  <!-- Spatial Scratchpad Slide-Over Tray -->
+  <aside class="scratchpad-tray" id="scratchpad-tray" aria-label="Scratchpad notes tray" aria-hidden="true"></aside>
+
+  <!-- Add / Edit Shortcut Modal -->
+  <div class="modal" id="shortcut-modal" role="dialog" aria-modal="true" aria-labelledby="shortcut-modal-title">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="shortcut-modal-title">Add Shortcut</h2>
+        <button type="button" class="close-btn" id="close-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body-pad">
+        <div class="form-group">
+          <label for="shortcut-title">Name</label>
+          <input type="text" id="shortcut-title" placeholder="GitHub">
+        </div>
+        <div class="form-group">
+          <label for="shortcut-url">URL Address</label>
+          <input type="text" id="shortcut-url" placeholder="github.com">
+        </div>
+        <button type="button" class="primary-btn" id="save-shortcut">Add Keycap</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Preferences Modal (Hydrated by SettingsUI) -->
+  <div class="modal" id="settings-modal" role="dialog" aria-modal="true" aria-label="Preferences"></div>
+
+</body>
+
+</html>

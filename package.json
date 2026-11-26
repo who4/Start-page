@@ -1,8 +1,7 @@
 {
   "name": "chrome-extension",
-  "version": "1.0.1",
-  "description": "",
-  "main": "api.js",
+  "version": "1.1.0",
+  "description": "System Terminal — minimalist three-pane Chrome new-tab extension.",
   "scripts": {
     "build": "vite build",
     "build:ext": "vite build --mode extension",
