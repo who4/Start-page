@@ -2,13 +2,30 @@ import './chrome-shim';
 import { ApiClient, type NewsArticle, type PriceData } from './api';
 import { attachPasteCapture, getEmptyStateResults } from './chrome-providers';
 import { ActionRegistry, CommandBarEngine, type BarResult } from './commandbar';
-import { getNewsSource, hostOfUrl, INTERVALS, STARTER_SHORTCUTS, STORAGE_KEYS, SUGGESTIONS } from './constants';
-import { createFaviconElement } from './favicons';
+import {
+  buildSearchUrl,
+  FINANCE_ASSETS,
+  getNewsSource,
+  getSearchEngine,
+  hostOfUrl,
+  INTERVALS,
+  STARTER_SHORTCUTS,
+  STORAGE_KEYS,
+  SUGGESTIONS,
+  type FinanceAssetId,
+  type MarketProviderId
+} from './constants';
+import {
+  ensureFaviconCachesLoaded,
+  getCachedFaviconElementSync,
+  LazyFaviconBatchLoader,
+  type LazyIconTask
+} from './favicons';
 import { BentoGrid, registry } from './grid';
 import { t } from './i18n';
 import { formatJalaliDate } from './jalali';
 import { SpatialScratchpad } from './scratchpad';
-import { SettingsUI } from './settings-ui';
+import { SettingsUI, type SettingsSectionId } from './settings-ui';
 import { storage } from './storage';
 import { applyTheme, THEME_PRESETS } from './themes';
 import type { NoteData, Settings, Shortcut } from './types';
@@ -228,7 +245,7 @@ async function ensureDeckInitialized(): Promise<void> {
   return deckInitPromise;
 }
 
-async function openSettingsModal(section: 'general' | 'appearance' | 'commands' | 'modules' | 'privacy' = 'general'): Promise<void> {
+async function openSettingsModal(section: SettingsSectionId = 'search'): Promise<void> {
   registerDeckModules();
   if (!settingsUI) {
     settingsUI = new SettingsUI(settings, {
@@ -286,6 +303,7 @@ drawerCustomizeBtn?.addEventListener('click', () => {
 
 // --- Command Bar ---
 const searchInput = document.getElementById('search-input') as HTMLInputElement | null;
+const commandSlotEl = searchInput?.closest('.command-slot') as HTMLElement | null;
 const suggestionsEl = document.getElementById('search-suggestions');
 const modeIndicator = document.getElementById('command-mode-indicator');
 
@@ -293,8 +311,36 @@ let barEngine: CommandBarEngine | null = null;
 const actionRegistry = new ActionRegistry();
 let debounceTimer: number | undefined;
 let currentResults: BarResult[] = [];
+let currentResultsQuery = '';
 let highlightedIndex = -1;
+let userSelectedIndex = false;
+let isLoadingSuggestions = false;
 let searchSeq = 0;
+
+function setSuggestionsLoading(loading: boolean): void {
+  isLoadingSuggestions = loading;
+  commandSlotEl?.classList.toggle('is-loading', loading);
+  if (suggestionsEl) {
+    suggestionsEl.setAttribute('aria-busy', String(loading));
+  }
+}
+
+function syncSearchEngineUi(): void {
+  if (!searchInput || !settings) return;
+  const engine = getSearchEngine(settings.general.searchEngine, settings.general.customSearchUrl);
+  searchInput.placeholder = `Search ${engine.name}...`;
+}
+
+function preconnectSearchEngine(): void {
+  if (!settings) return;
+  const engine = getSearchEngine(settings.general.searchEngine, settings.general.customSearchUrl);
+  preconnectUrl(engine.origin);
+  preconnectUrl(
+    engine.suggestKind === 'duckduckgo'
+      ? 'https://duckduckgo.com'
+      : 'https://suggestqueries.google.com'
+  );
+}
 
 function getShortcutCache(): Shortcut[] {
   return shortcutsCache;
@@ -311,7 +357,7 @@ function updateModeIndicator(query: string): void {
   } else if (/\d/.test(query) && /[+\-*/%^×÷]|sqrt|sin|cos|tan|log|ln/i.test(query)) {
     modeIndicator.textContent = '=';
     modeIndicator.dataset.mode = 'calc';
-  } else if (/\b(usd|gold|dollar|toman|irt)\b|\$/i.test(query)) {
+  } else if (/\b(usdt|tether|usd|gold|dollar|toman|irt)\b|\$/i.test(query)) {
     modeIndicator.textContent = '⇄';
     modeIndicator.dataset.mode = 'money';
   } else {
@@ -322,7 +368,7 @@ function updateModeIndicator(query: string): void {
 
 function renderBarResults(results: BarResult[]): void {
   if (!suggestionsEl) return;
-  if (results.length === 0) {
+  if (results.length === 0 && !isLoadingSuggestions) {
     clearBar();
     return;
   }
@@ -383,10 +429,41 @@ function renderBarResults(results: BarResult[]): void {
     listWrap.appendChild(item);
   });
 
+  if (isLoadingSuggestions) {
+    const skeletonWidths = ['54%', '38%', '64%'];
+    for (const width of skeletonWidths) {
+      const skRow = document.createElement('div');
+      skRow.className = 'suggestion-skeleton-row';
+      skRow.setAttribute('aria-hidden', 'true');
+
+      const skIcon = document.createElement('span');
+      skIcon.className = 'skeleton-icon';
+
+      const skText = document.createElement('span');
+      skText.className = 'bar-text-wrap skeleton-text-wrap';
+
+      const skTitle = document.createElement('span');
+      skTitle.className = 'skeleton-line skeleton-line--title';
+      skTitle.style.width = width;
+
+      const skHint = document.createElement('span');
+      skHint.className = 'skeleton-line skeleton-line--hint';
+
+      skText.append(skTitle, skHint);
+      skRow.append(skIcon, skText);
+      listWrap.appendChild(skRow);
+    }
+  }
+
   const footer = document.createElement('div');
   footer.className = 'suggestions-footer';
-  footer.innerHTML =
-    '<span><kbd>!g</kbd> <kbd>!gh</kbd> bangs</span><span><kbd>&gt;</kbd> commands</span><span><kbd>100 usd</kbd> convert</span><span><kbd>↑↓</kbd> <kbd>↵</kbd></span>';
+  if (isLoadingSuggestions) {
+    footer.innerHTML =
+      '<span class="suggestions-loading-label">Loading suggestions…</span><span><kbd>↵</kbd> search now</span>';
+  } else {
+    footer.innerHTML =
+      '<span><kbd>!g</kbd> <kbd>!gh</kbd> bangs</span><span><kbd>&gt;</kbd> commands</span><span><kbd>100 usd</kbd> convert</span><span><kbd>↑↓</kbd> <kbd>↵</kbd></span>';
+  }
 
   fragment.append(listWrap, footer);
   suggestionsEl.replaceChildren(fragment);
@@ -413,29 +490,96 @@ function clampSuggestionsHeight(): void {
 window.addEventListener('resize', clampSuggestionsHeight);
 
 function clearBar(): void {
+  window.clearTimeout(debounceTimer);
+  ApiClient.abortSuggestions();
+  setSuggestionsLoading(false);
   suggestionsEl?.replaceChildren();
   suggestionsEl?.classList.remove('visible');
   currentResults = [];
+  currentResultsQuery = '';
   highlightedIndex = -1;
+  userSelectedIndex = false;
 }
 
-async function runSearch(): Promise<void> {
+function runProgressiveSearch(query: string): void {
   if (!searchInput || !barEngine) return;
-  const query = searchInput.value.trim();
   const seq = ++searchSeq;
+  window.clearTimeout(debounceTimer);
+  ApiClient.abortSuggestions();
+
   if (query.length < SUGGESTIONS.minQueryLength) {
     clearBar();
     return;
   }
 
-  const { results } = await barEngine.search(query);
-  if (seq !== searchSeq) return;
-  currentResults = results;
-  highlightedIndex = results.length > 0 ? 0 : -1;
-  renderBarResults(results);
+  // Phase 1 (0ms synchronous): render instant search/URL/bang/calc/shortcut results immediately
+  const instant = barEngine.searchInstant(query);
+  const engineId = settings?.general.searchEngine ?? 'google';
+  const willFetchNetwork = !instant.exclusive && query.length >= 2;
+  const cachedSugg = willFetchNetwork ? ApiClient.getCachedSuggestions(query, engineId) : null;
+  const needsDebouncedFetch = willFetchNetwork && !cachedSugg;
+
+  setSuggestionsLoading(needsDebouncedFetch);
+
+  let instantList = instant.results;
+  let localList: BarResult[] = [];
+  let netList: BarResult[] = [];
+
+  const applyMerged = (): void => {
+    if (seq !== searchSeq || !barEngine) return;
+    const prevSelectedId =
+      userSelectedIndex && highlightedIndex >= 0 ? currentResults[highlightedIndex]?.id : undefined;
+    const merged = instant.exclusive
+      ? instantList
+      : barEngine.mergeLists([instantList, localList, netList]);
+    currentResults = merged;
+    currentResultsQuery = query;
+    if (prevSelectedId) {
+      const preserved = merged.findIndex((r) => r.id === prevSelectedId);
+      highlightedIndex = preserved >= 0 ? preserved : 0;
+    } else {
+      highlightedIndex = merged.length > 0 ? 0 : -1;
+    }
+    renderBarResults(merged);
+  };
+
+  applyMerged();
+  if (instant.exclusive) return;
+
+  // Phase 2a (local async — tabs, bookmarks, history, currency — zero network wait)
+  void barEngine.searchLocalAsync(query).then((res) => {
+    if (seq !== searchSeq || res.length === 0) return;
+    localList = res;
+    applyMerged();
+  });
+
+  // Phase 2b (network autocomplete — 0ms if LRU cached, otherwise debounced with skeleton state)
+  if (willFetchNetwork) {
+    const runNet = (): void => {
+      if (seq !== searchSeq || !barEngine) return;
+      void barEngine
+        .searchNetworkSuggestions(query)
+        .then((res) => {
+          if (seq !== searchSeq) return;
+          netList = res;
+        })
+        .finally(() => {
+          if (seq !== searchSeq) return;
+          setSuggestionsLoading(false);
+          applyMerged();
+        });
+    };
+
+    if (cachedSugg) {
+      runNet();
+    } else {
+      debounceTimer = window.setTimeout(runNet, SUGGESTIONS.debounceMs);
+    }
+  }
 }
 
 function executeResult(r: BarResult): void {
+  activeFaviconLoader?.cancelPending();
   clearBar();
   if (searchInput) {
     searchInput.value = '';
@@ -446,6 +590,7 @@ function executeResult(r: BarResult): void {
 
 async function showEmptyState(): Promise<void> {
   if (!suggestionsEl) return;
+  setSuggestionsLoading(false);
   const results = await getEmptyStateResults(
     getShortcutCache(),
     settings?.privacy.clipboardHistory ?? false
@@ -474,7 +619,9 @@ async function showEmptyState(): Promise<void> {
   const combined = [...results, ...quickCmds];
   if (combined.length === 0) return;
   currentResults = combined;
+  currentResultsQuery = '';
   highlightedIndex = -1;
+  userSelectedIndex = false;
   renderBarResults(combined);
 }
 
@@ -482,6 +629,7 @@ if (searchInput && suggestionsEl) {
   attachPasteCapture(searchInput, () => settings?.privacy.clipboardHistory ?? false);
 
   searchInput.addEventListener('focus', () => {
+    preconnectSearchEngine();
     if (searchInput.value.trim().length === 0) {
       void showEmptyState();
     }
@@ -489,6 +637,7 @@ if (searchInput && suggestionsEl) {
 
   const moveHighlight = (delta: number): void => {
     if (currentResults.length === 0) return;
+    userSelectedIndex = true;
     highlightedIndex =
       highlightedIndex === -1
         ? delta > 0
@@ -500,20 +649,21 @@ if (searchInput && suggestionsEl) {
 
   searchInput.addEventListener('input', () => {
     const query = searchInput.value.trim();
+    userSelectedIndex = false;
     updateModeIndicator(query);
 
     const isPersian = /[؀-ۿ]/.test(query);
     searchInput.style.direction = isPersian ? 'rtl' : 'ltr';
 
-    window.clearTimeout(debounceTimer);
     if (query.length < SUGGESTIONS.minQueryLength) {
+      window.clearTimeout(debounceTimer);
+      ApiClient.abortSuggestions();
+      setSuggestionsLoading(false);
       void showEmptyState();
       return;
     }
 
-    debounceTimer = window.setTimeout(() => {
-      void runSearch();
-    }, SUGGESTIONS.debounceMs);
+    runProgressiveSearch(query);
   });
 
   searchInput.addEventListener('keydown', (e) => {
@@ -524,17 +674,39 @@ if (searchInput && suggestionsEl) {
       e.preventDefault();
       moveHighlight(-1);
     } else if (e.key === 'Enter') {
-      const chosen =
-        highlightedIndex >= 0 && currentResults[highlightedIndex]
-          ? currentResults[highlightedIndex]
-          : currentResults[0];
-      if (chosen) {
-        e.preventDefault();
-        executeResult(chosen);
+      e.preventDefault();
+      const query = searchInput.value.trim();
+      activeFaviconLoader?.cancelPending();
+      window.clearTimeout(debounceTimer);
+      ApiClient.abortSuggestions();
+
+      // 1. If the user explicitly arrow-keyed to an item, run it immediately
+      if (userSelectedIndex && highlightedIndex >= 0 && currentResults[highlightedIndex]) {
+        executeResult(currentResults[highlightedIndex]);
         return;
       }
-      if (searchInput.value.trim()) {
-        window.location.href = `https://www.google.com/search?q=${encodeURIComponent(searchInput.value.trim())}`;
+
+      if (!query) return;
+
+      // 2. If instant local results for this EXACT query have a utility (calc/money/bang/>cmd), run it
+      const top = currentResultsQuery === query ? currentResults[0] : undefined;
+      if (top && (top.icon === 'calc' || top.icon === 'money' || top.icon === 'bang' || query.startsWith('>'))) {
+        executeResult(top);
+        return;
+      }
+
+      // 3. Otherwise navigate immediately (0ms) via direct URL or selected search engine
+      clearBar();
+      searchInput.value = '';
+      updateModeIndicator('');
+      if (barEngine) {
+        barEngine.resolveEnterAction(query)();
+      } else {
+        window.location.href = buildSearchUrl(
+          settings?.general.searchEngine,
+          query,
+          settings?.general.customSearchUrl
+        );
       }
     } else if (e.key === 'Escape') {
       clearBar();
@@ -566,10 +738,21 @@ async function loadShortcuts(): Promise<void> {
 }
 
 let shortcutRenderSeq = 0;
+let activeFaviconLoader: LazyFaviconBatchLoader | null = null;
+
+window.addEventListener('pagehide', () => {
+  activeFaviconLoader?.cancelPending();
+});
 
 function renderShortcuts(shortcuts: Shortcut[]): void {
   const renderSeq = ++shortcutRenderSeq;
+  activeFaviconLoader?.dispose();
+  activeFaviconLoader = null;
+
   const iconStyle = settings?.appearance.bookmarkIconStyle ?? 'dithered';
+  const loader = iconStyle !== 'off' ? new LazyFaviconBatchLoader(shortcutsGrid, 120, 3) : null;
+  activeFaviconLoader = loader;
+  const pendingTasks: LazyIconTask[] = [];
   const fragment = document.createDocumentFragment();
 
   shortcuts.forEach((shortcut, index) => {
@@ -584,6 +767,12 @@ function renderShortcuts(shortcuts: Shortcut[]): void {
     // Preconnect DNS/TLS on hover or keyboard focus so clicking opens the site noticeably faster
     card.addEventListener('pointerenter', () => preconnectUrl(href), { passive: true });
     card.addEventListener('focus', () => preconnectUrl(href), { passive: true });
+    // Immediately cancel pending uncached icon batches when navigating away
+    card.addEventListener('click', (e) => {
+      if (!e.defaultPrevented && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+        activeFaviconLoader?.cancelPending();
+      }
+    });
 
     const leftWrap = document.createElement('span');
     leftWrap.className = 'shortcut-left-wrap';
@@ -594,11 +783,18 @@ function renderShortcuts(shortcuts: Shortcut[]): void {
       iconSlot.setAttribute('aria-hidden', 'true');
       leftWrap.appendChild(iconSlot);
 
-      void createFaviconElement(shortcut.url || '', iconStyle).then((el) => {
-        if (renderSeq !== shortcutRenderSeq || !el) return;
-        iconSlot.replaceChildren(el);
+      const cachedEl = getCachedFaviconElementSync(shortcut.url || '', iconStyle);
+      if (cachedEl) {
+        iconSlot.replaceChildren(cachedEl);
         iconSlot.classList.add('is-loaded');
-      });
+      } else {
+        iconSlot.classList.add('is-pending');
+        pendingTasks.push({
+          slot: iconSlot,
+          url: shortcut.url || '',
+          style: iconStyle
+        });
+      }
     }
 
     const labelWrap = document.createElement('span');
@@ -687,6 +883,23 @@ function renderShortcuts(shortcuts: Shortcut[]): void {
   });
 
   shortcutsGrid.replaceChildren(fragment);
+
+  if (pendingTasks.length > 0 && loader) {
+    void ensureFaviconCachesLoaded().then(() => {
+      if (renderSeq !== shortcutRenderSeq || activeFaviconLoader !== loader) return;
+      for (const task of pendingTasks) {
+        if (!task.slot.isConnected) continue;
+        const cachedEl = getCachedFaviconElementSync(task.url, task.style);
+        if (cachedEl) {
+          task.slot.replaceChildren(cachedEl);
+          task.slot.classList.remove('is-pending');
+          task.slot.classList.add('is-loaded');
+        } else {
+          loader.observe(task);
+        }
+      }
+    });
+  }
 }
 
 async function reorderShortcuts(from: number, to: number): Promise<void> {
@@ -787,61 +1000,155 @@ saveShortcutBtn?.addEventListener('click', async () => {
 });
 
 // --- Right Pane Live Telemetry (Cached-first + Deferred Stale Revalidation) ---
-function renderPriceMetrics(data: Partial<Record<'usd' | 'gold', PriceData>>, recordHistory: boolean): void {
-  const usdEl = document.getElementById('price-usd');
-  const goldEl = document.getElementById('price-gold');
-  const usdBigEl = document.getElementById('price-usd-big');
-  if (!usdEl || !goldEl) return;
+function getActiveMarketConfig(): {
+  provider: MarketProviderId;
+  assets: FinanceAssetId[];
+  spotlight: FinanceAssetId;
+} {
+  const provider: MarketProviderId = settings?.finance.provider ?? 'auto';
+  const configured = (settings?.finance.assets ?? []).filter(
+    (id): id is FinanceAssetId => id in FINANCE_ASSETS
+  );
+  const assets: FinanceAssetId[] =
+    configured.length > 0 ? configured.slice(0, 4) : ['usdt', 'usd', 'gold', 'btc'];
+  const configuredSpot = settings?.finance.spotlight;
+  const spotlight: FinanceAssetId =
+    configuredSpot && assets.includes(configuredSpot) ? configuredSpot : assets[0];
+  return { provider, assets, spotlight };
+}
 
-  const renderMetric = (
-    el: HTMLElement,
-    asset: 'usd' | 'gold',
-    label: string,
-    rawPrice: string,
-    trend: 'up' | 'down' | 'flat'
-  ): void => {
-    if (rawPrice === 'Error' || rawPrice === 'Unavailable') {
-      el.textContent = `${label} OFFLINE`;
-      el.className = 'price-item';
-      if (asset === 'usd' && usdBigEl) usdBigEl.textContent = '---';
-      return;
-    }
-    const rialNum = parseInt(rawPrice.replace(/,/g, ''), 10);
-    if (recordHistory && Number.isFinite(rialNum) && rialNum > 0) {
-      void appendPricePoint(asset, rialNum, trend);
-    }
-    const toman = Number.isFinite(rialNum) ? Math.round(rialNum / 10) : NaN;
-    const formatted = Number.isFinite(toman) ? toman.toLocaleString('en-US') : rawPrice;
-    const prefix = trend === 'up' ? '+ ' : trend === 'down' ? '- ' : '';
-    const arrow = trend === 'up' ? ' ▲' : trend === 'down' ? ' ▼' : '';
-    el.textContent = `${prefix}${label} ${formatted}${arrow}`;
-    el.className = 'price-item' + (trend === 'up' ? ' is-up' : trend === 'down' ? ' is-down' : '');
+function formatSpotlightBig(asset: FinanceAssetId, item: PriceData | undefined): string {
+  if (!item || item.price === 'Error' || item.price === 'Unavailable') return '---';
+  const def = FINANCE_ASSETS[asset];
+  const raw = parseFloat(item.price.replace(/,/g, ''));
+  if (def.unit === 'usd') {
+    const val = item.numericValue ?? raw;
+    if (!Number.isFinite(val)) return '---';
+    if (val >= 10_000) return `$${(val / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+    if (val >= 1_000) return `$${Math.round(val).toLocaleString('en-US')}`;
+    return `$${val.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+  }
+  const toman = item.numericValue ?? (Number.isFinite(raw) ? Math.round(raw / 10) : NaN);
+  if (!Number.isFinite(toman)) return item.price;
+  if (toman >= 1_000_000) return `${(toman / 1_000_000).toFixed(2).replace(/\.00$/, '')}M`;
+  if (toman >= 1_000) return `${Math.round(toman / 1000)}k`;
+  return toman.toLocaleString('en-US');
+}
 
-    if (asset === 'usd' && usdBigEl) {
-      if (Number.isFinite(toman) && toman >= 1000) {
-        usdBigEl.textContent = `${Math.round(toman / 1000)}k`;
-      } else {
-        usdBigEl.textContent = formatted;
+function formatTickerRowPrice(asset: FinanceAssetId, item: PriceData): string {
+  const def = FINANCE_ASSETS[asset];
+  const raw = parseFloat(item.price.replace(/,/g, ''));
+  if (def.unit === 'usd') {
+    const val = item.numericValue ?? raw;
+    if (!Number.isFinite(val)) return `$${item.price}`;
+    return `$${val.toLocaleString('en-US', { maximumFractionDigits: val >= 1000 ? 0 : 2 })}`;
+  }
+  const toman = item.numericValue ?? (Number.isFinite(raw) ? Math.round(raw / 10) : NaN);
+  return Number.isFinite(toman) ? toman.toLocaleString('en-US') : item.price;
+}
+
+function renderPriceMetrics(
+  data: Partial<Record<FinanceAssetId, PriceData>>,
+  recordHistory: boolean
+): void {
+  const listEl = document.getElementById('price-list');
+  const bigEl = document.getElementById('price-usd-big');
+  const sublabelEl = document.getElementById('price-spotlight-label');
+  const sourceMetaEl = document.getElementById('price-source-meta');
+  if (!listEl) return;
+
+  const { assets, spotlight } = getActiveMarketConfig();
+  const spotDef = FINANCE_ASSETS[spotlight];
+  if (sublabelEl) sublabelEl.textContent = spotDef.sublabel;
+  if (bigEl) bigEl.textContent = formatSpotlightBig(spotlight, data[spotlight]);
+
+  const fragment = document.createDocumentFragment();
+  const sources = new Set<string>();
+
+  for (const assetId of assets) {
+    const def = FINANCE_ASSETS[assetId];
+    const item = data[assetId];
+    const row = document.createElement('span');
+
+    if (!item) {
+      row.className = 'price-item';
+      row.textContent = `${def.code} —`;
+      fragment.appendChild(row);
+      continue;
+    }
+
+    if (item.price === 'Error' || item.price === 'Unavailable') {
+      row.className = 'price-item';
+      row.textContent = `${def.code} OFFLINE`;
+      fragment.appendChild(row);
+      continue;
+    }
+
+    if (item.source) sources.add(item.source);
+
+    if (recordHistory) {
+      const parsedRaw = parseFloat(item.price.replace(/,/g, ''));
+      const historyVal =
+        def.unit === 'toman'
+          ? Number.isFinite(parsedRaw)
+            ? Math.round(parsedRaw)
+            : item.numericValue !== undefined
+            ? Math.round(item.numericValue * 10)
+            : NaN
+          : item.numericValue ?? parsedRaw;
+      if (Number.isFinite(historyVal) && historyVal > 0) {
+        void appendPricePoint(assetId, historyVal, item.trend);
       }
     }
-  };
 
-  if (data.usd) renderMetric(usdEl, 'usd', 'USD', data.usd.price, data.usd.trend);
-  if (data.gold) renderMetric(goldEl, 'gold', 'GOLD', data.gold.price, data.gold.trend);
+    const formatted = formatTickerRowPrice(assetId, item);
+    const arrow = item.trend === 'up' ? '▲' : item.trend === 'down' ? '▼' : '';
+    let deltaStr = '';
+    if (item.changePercent !== undefined && Number.isFinite(item.changePercent) && Math.abs(item.changePercent) >= 0.05) {
+      const sign = item.changePercent > 0 ? '+' : '';
+      deltaStr = `${sign}${item.changePercent.toFixed(1)}%${arrow ? ` ${arrow}` : ''}`;
+    } else if (arrow) {
+      deltaStr = arrow;
+    }
+
+    row.className =
+      'price-item' + (item.trend === 'up' ? ' is-up' : item.trend === 'down' ? ' is-down' : '');
+
+    const leftText = document.createElement('span');
+    leftText.className = 'price-row-main';
+    leftText.textContent = `${def.code} ${formatted}`;
+    row.appendChild(leftText);
+
+    if (deltaStr) {
+      const deltaEl = document.createElement('span');
+      deltaEl.className = 'price-delta';
+      deltaEl.textContent = deltaStr;
+      row.appendChild(deltaEl);
+    }
+
+    fragment.appendChild(row);
+  }
+
+  listEl.replaceChildren(fragment);
+
+  if (sourceMetaEl) {
+    sourceMetaEl.textContent = sources.size > 0 ? Array.from(sources).join(' · ') : '';
+  }
 }
 
 async function updatePrices(forceRefresh = false): Promise<void> {
   if (!settings?.widgets.priceTicker) return;
+  const { assets, provider } = getActiveMarketConfig();
 
   if (!forceRefresh) {
-    const cached = await ApiClient.getCachedPrices(['usd', 'gold']);
-    if (cached.data.usd || cached.data.gold) {
+    const cached = await ApiClient.getCachedPrices(assets, provider);
+    if (Object.keys(cached.data).length > 0) {
       renderPriceMetrics(cached.data, false);
     }
     if (cached.fresh) return;
   }
 
-  const data = await ApiClient.fetchPrices(['usd', 'gold']);
+  const data = await ApiClient.fetchPrices(assets, provider);
   renderPriceMetrics(data, true);
 }
 
@@ -1063,8 +1370,9 @@ function startWidgetTimers(deferNetwork = false): void {
       });
     }
     if (settings?.widgets.priceTicker) {
-      void ApiClient.getCachedPrices(['usd', 'gold']).then((c) => {
-        if (c.data.usd || c.data.gold) renderPriceMetrics(c.data, false);
+      const { assets, provider } = getActiveMarketConfig();
+      void ApiClient.getCachedPrices(assets, provider).then((c) => {
+        if (Object.keys(c.data).length > 0) renderPriceMetrics(c.data, false);
       });
     }
     if (settings?.widgets.newsWidget) {
@@ -1101,7 +1409,7 @@ document.getElementById('nav-scratchpad-btn')?.addEventListener('click', () => {
 });
 
 document.getElementById('nav-settings-btn')?.addEventListener('click', () => {
-  void openSettingsModal('general');
+  void openSettingsModal('search');
 });
 
 // --- Global Keyboard Navigation ---
@@ -1178,6 +1486,8 @@ document.addEventListener('keydown', (e) => {
 
 // --- Boot (Instant First Paint: 1 batched storage read, lazy deck & settings, deferred telemetry) ---
 (async function boot(): Promise<void> {
+  // Kick off favicon cache read alongside settings snapshot so repeat opens hydrate icons synchronously
+  const faviconReady = ensureFaviconCachesLoaded();
   const snapshot = await storage.getMany([
     STORAGE_KEYS.settings,
     STORAGE_KEYS.shortcuts,
@@ -1186,9 +1496,11 @@ document.addEventListener('keydown', (e) => {
     STORAGE_KEYS.notesVisible,
     STORAGE_KEYS.drawerOpen
   ]);
+  await faviconReady;
 
   settings = storage.parseSettings(snapshot[STORAGE_KEYS.settings]);
   applyTheme(settings);
+  syncSearchEngineUi();
   startClock();
 
   // Render bookmarks FIRST so they are immediately interactive
@@ -1207,12 +1519,19 @@ document.addEventListener('keydown', (e) => {
   const persistSettings = async (updated: Settings): Promise<void> => {
     const prevTheme = settings?.appearance.themePreset;
     const prevIconStyle = settings?.appearance.bookmarkIconStyle;
+    const prevProvider = settings?.finance.provider;
     settings = updated;
     await storage.saveSettings(updated);
     applyTheme(updated);
+    syncSearchEngineUi();
     settingsUI?.syncExternal(updated);
     startClock();
-    startWidgetTimers(false);
+    if (prevProvider !== updated.finance.provider) {
+      ApiClient.clearPriceCache();
+      startWidgetTimers(false);
+    } else {
+      startWidgetTimers(false);
+    }
     if (prevTheme !== updated.appearance.themePreset || prevIconStyle !== updated.appearance.bookmarkIconStyle) {
       renderShortcuts(shortcutsCache);
     }
@@ -1269,7 +1588,7 @@ document.addEventListener('keydown', (e) => {
   actionRegistry.register({
     name: 'Open Preferences',
     aliases: ['settings', 'config', 'bangs'],
-    run: () => void openSettingsModal('general')
+    run: () => void openSettingsModal('search')
   });
   actionRegistry.register({
     name: 'Toggle Jalali / Gregorian Calendar',
@@ -1303,8 +1622,15 @@ document.addEventListener('keydown', (e) => {
   barEngine = new CommandBarEngine(actionRegistry, getShortcutCache, {
     historyEnabled: () => settings?.privacy.historySearch ?? false,
     clipboardEnabled: () => settings?.privacy.clipboardHistory ?? false,
+    getSearchEngine: () => ({
+      id: settings?.general.searchEngine ?? 'google',
+      customUrl: settings?.general.customSearchUrl
+    }),
     onCopy: (label) => showToast(label)
   });
+
+  // Pre-warm DNS/TLS to active search engine during idle so first search/suggestion is instant
+  scheduleIdle(() => preconnectSearchEngine(), 400);
 
   // Only mount Workspace Deck on boot if user explicitly chose to remember an open drawer
   if (settings.general.rememberDrawerState && snapshot[STORAGE_KEYS.drawerOpen] === true) {

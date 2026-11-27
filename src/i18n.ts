@@ -51,7 +51,7 @@ const en = {
   clipboardNote: 'Clipboard entries are captured only when you paste into the command slot, stored locally, and never synced.',
   versionLabel: 'Build Version',
   reloadExtension: 'Reload Extension',
-  dataSources: 'Markets by TGJU / BRS · Weather by Open-Meteo · Headlines via RSS.',
+  dataSources: 'Markets by AlanChand, Nobitex, Wallex, TGJU & Binance · Weather by Open-Meteo · Headlines via RSS.',
   noRecentNews: 'No recent top stories available',
   loadingTopStory: 'Fetching latest headline...',
   breaking: 'BBC World',

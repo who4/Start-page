@@ -9,8 +9,12 @@ const manifest = defineManifest({
   permissions: ['storage', 'tabs', 'bookmarks', 'history', 'contextMenus', 'alarms', 'notifications', 'favicon'],
   host_permissions: [
     '*://*.google.com/*',
+    '*://alanchand.com/*',
     '*://*.tgju.org/*',
-    '*://brsapi.ir/*',
+    '*://apiv2.nobitex.ir/*',
+    '*://api.wallex.ir/*',
+    '*://api.binance.com/*',
+    '*://duckduckgo.com/*',
     '*://api.rss2json.com/*',
     '*://feeds.bbci.co.uk/*',
     '*://www.aljazeera.com/*',
@@ -43,8 +47,12 @@ const manifest = defineManifest({
 
 const ALLOWED_PROXY_HOSTS = [
   'google.com',
+  'alanchand.com',
   'tgju.org',
-  'brsapi.ir',
+  'nobitex.ir',
+  'wallex.ir',
+  'binance.com',
+  'duckduckgo.com',
   'rss2json.com',
   'open-meteo.com',
   'photon.komoot.io',
@@ -581,6 +589,7 @@ function attachPreviewMiddlewares(middlewares: {
     if (rawUrl.startsWith('/api/suggestions')) {
       const parsed = new URL(rawUrl, 'http://localhost');
       const query = parsed.searchParams.get('q') || '';
+      const engine = (parsed.searchParams.get('engine') || 'google').toLowerCase();
       if (!query) {
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -588,19 +597,29 @@ function attachPreviewMiddlewares(middlewares: {
         return;
       }
 
-      const targetUrl = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`;
-      fetch(targetUrl)
-        .then((upstream) => upstream.json() as Promise<unknown[]>)
-        .then((data) => {
-          const payload = Array.isArray(data?.[1]) ? data[1] : [];
+      const useDdg = engine === 'duckduckgo' || engine === 'brave' || engine === 'startpage' || engine === 'kagi';
+      const primaryUrl = useDdg
+        ? `https://duckduckgo.com/ac/?q=${encodeURIComponent(query)}&type=list`
+        : `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`;
+      const fallbackUrl = useDdg
+        ? `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`
+        : `https://duckduckgo.com/ac/?q=${encodeURIComponent(query)}&type=list`;
+
+      const fetchList = async (url: string): Promise<string[]> => {
+        const upstream = await fetch(url, { signal: AbortSignal.timeout(1800) });
+        if (!upstream.ok) return [];
+        const data = (await upstream.json()) as unknown[];
+        return Array.isArray(data?.[1]) ? (data[1] as string[]) : [];
+      };
+
+      fetchList(primaryUrl)
+        .then(async (list) => (list.length > 0 ? list : await fetchList(fallbackUrl).catch(() => [])))
+        .catch(() => fetchList(fallbackUrl).catch(() => []))
+        .then((payload) => {
           res.statusCode = 200;
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Cache-Control', 'public, max-age=300');
           res.end(JSON.stringify(payload));
-        })
-        .catch(() => {
-          res.statusCode = 200;
-          res.setHeader('Content-Type', 'application/json; charset=utf-8');
-          res.end('[]');
         });
       return;
     }

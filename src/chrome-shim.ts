@@ -142,7 +142,7 @@ function installChromeShim(): void {
     }
   };
 
-  const handleMessage = async (message: { action?: string; url?: string; query?: string }): Promise<unknown> => {
+  const handleMessage = async (message: { action?: string; url?: string; query?: string; engine?: string }): Promise<unknown> => {
     if (message?.action === 'PROXY_FETCH' && typeof message.url === 'string') {
       try {
         const resp = await fetch(`/api/proxy?url=${encodeURIComponent(message.url)}`);
@@ -171,7 +171,8 @@ function installChromeShim(): void {
 
     if (message?.action === 'FETCH_SUGGESTIONS' && typeof message.query === 'string') {
       try {
-        const resp = await fetch(`/api/suggestions?q=${encodeURIComponent(message.query)}`);
+        const engParam = message.engine ? `&engine=${encodeURIComponent(message.engine)}` : '';
+        const resp = await fetch(`/api/suggestions?q=${encodeURIComponent(message.query)}${engParam}`);
         if (!resp.ok) {
           return { success: false, error: `HTTP ${resp.status}` };
         }

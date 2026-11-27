@@ -15,8 +15,12 @@
   ],
   "host_permissions": [
     "*://*.google.com/*",
+    "*://alanchand.com/*",
     "*://*.tgju.org/*",
-    "*://brsapi.ir/*",
+    "*://apiv2.nobitex.ir/*",
+    "*://api.wallex.ir/*",
+    "*://api.binance.com/*",
+    "*://duckduckgo.com/*",
     "*://api.rss2json.com/*",
     "*://feeds.bbci.co.uk/*",
     "*://www.aljazeera.com/*",

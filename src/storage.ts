@@ -17,6 +17,8 @@ export const DEFAULT_SETTINGS: Settings = {
     colorPalette: []
   },
   general: {
+    searchEngine: 'google',
+    customSearchUrl: '',
     calendar: 'gregorian',
     clock24h: true,
     showSeconds: true,
@@ -53,7 +55,9 @@ export const DEFAULT_SETTINGS: Settings = {
     clipboardHistory: false
   },
   finance: {
-    assets: ['usd', 'gold'],
+    provider: 'auto',
+    spotlight: 'usdt',
+    assets: ['usdt', 'usd', 'gold', 'btc'],
     alerts: []
   }
 };

@@ -673,6 +673,25 @@ function createCachedImgElement(
   return img;
 }
 
+export function ensureFaviconCachesLoaded(): Promise<void> {
+  return ensureCachesLoaded();
+}
+
+export function getCachedFaviconElementSync(
+  url: string,
+  style: BookmarkIconStyle = 'dithered'
+): HTMLElement | null {
+  if (style === 'off' || !processedCacheData) return null;
+  const domain = domainOf(url);
+  if (!domain) return null;
+  const scheme = isDarkScheme() ? 'dark' : 'light';
+  const entry = processedCacheData[`${domain}:${style}:${scheme}`];
+  if (entry && entry.dataUrl && Date.now() - entry.fetchedAt < CACHE_TTL_MS) {
+    return createCachedImgElement(entry.dataUrl, style);
+  }
+  return null;
+}
+
 export async function createFaviconElement(
   url: string,
   style: BookmarkIconStyle = 'dithered'
@@ -682,16 +701,8 @@ export async function createFaviconElement(
   if (!domain) return null;
 
   await ensureCachesLoaded();
-  const scheme = isDarkScheme() ? 'dark' : 'light';
-  const processedKey = `${domain}:${style}:${scheme}`;
-  const cachedProcessed = processedCacheData?.[processedKey];
-  if (
-    cachedProcessed &&
-    cachedProcessed.dataUrl &&
-    Date.now() - cachedProcessed.fetchedAt < CACHE_TTL_MS
-  ) {
-    return createCachedImgElement(cachedProcessed.dataUrl, style);
-  }
+  const cachedEl = getCachedFaviconElementSync(url, style);
+  if (cachedEl) return cachedEl;
 
   const dataUrl = await getFaviconDataUrl(url);
   if (dataUrl) {
@@ -700,6 +711,8 @@ export async function createFaviconElement(
       const canvas = renderProcessedIcon(img, style);
       try {
         const pngDataUrl = canvas.toDataURL('image/png');
+        const scheme = isDarkScheme() ? 'dark' : 'light';
+        const processedKey = `${domain}:${style}:${scheme}`;
         if (pngDataUrl && processedCacheData) {
           processedCacheData[processedKey] = { dataUrl: pngDataUrl, fetchedAt: Date.now() };
           processedDirty = true;
@@ -713,4 +726,134 @@ export async function createFaviconElement(
   }
 
   return renderFallbackMonogram(domain, style);
+}
+
+// --- Viewport-Lazy Debounced Batch Loader for Uncached Bookmark Icons ---
+
+export interface LazyIconTask {
+  slot: HTMLElement;
+  url: string;
+  style: Exclude<BookmarkIconStyle, 'off'>;
+}
+
+export class LazyFaviconBatchLoader {
+  private observer: IntersectionObserver | null = null;
+  private slotToTask = new Map<Element, LazyIconTask>();
+  private visiblePending = new Set<LazyIconTask>();
+  private inProgress = new Set<LazyIconTask>();
+  private debounceTimer: number | undefined;
+  private batchTimer: number | undefined;
+  private disposed = false;
+
+  constructor(
+    private scrollRoot: HTMLElement | null,
+    private debounceMs = 120,
+    private batchSize = 3
+  ) {
+    if (typeof IntersectionObserver !== 'undefined') {
+      this.observer = new IntersectionObserver(
+        (entries) => {
+          if (this.disposed) return;
+          let added = false;
+          for (const entry of entries) {
+            const task = this.slotToTask.get(entry.target);
+            if (!task || this.inProgress.has(task)) continue;
+            if (entry.isIntersecting) {
+              this.visiblePending.add(task);
+              added = true;
+            } else {
+              // User scrolled past before debounce elapsed — skip unnecessary fetch
+              this.visiblePending.delete(task);
+            }
+          }
+          if (added) {
+            this.scheduleFlush();
+          }
+        },
+        {
+          root: this.scrollRoot,
+          rootMargin: '48px 0px',
+          threshold: 0.01
+        }
+      );
+    }
+  }
+
+  observe(task: LazyIconTask): void {
+    if (this.disposed) return;
+    this.slotToTask.set(task.slot, task);
+    if (this.observer) {
+      this.observer.observe(task.slot);
+    } else {
+      this.visiblePending.add(task);
+      this.scheduleFlush();
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this.disposed) return;
+    window.clearTimeout(this.debounceTimer);
+    this.debounceTimer = window.setTimeout(() => {
+      this.debounceTimer = undefined;
+      void this.flushBatch();
+    }, this.debounceMs);
+  }
+
+  private async flushBatch(): Promise<void> {
+    if (this.disposed || this.visiblePending.size === 0) return;
+
+    const batch: LazyIconTask[] = [];
+    for (const task of this.visiblePending) {
+      if (batch.length >= this.batchSize) break;
+      batch.push(task);
+    }
+
+    for (const task of batch) {
+      this.visiblePending.delete(task);
+      this.inProgress.add(task);
+      this.observer?.unobserve(task.slot);
+      this.slotToTask.delete(task.slot);
+    }
+
+    await Promise.all(
+      batch.map(async (task) => {
+        if (this.disposed) return;
+        try {
+          const el = await createFaviconElement(task.url, task.style);
+          if (this.disposed || !el || !task.slot.isConnected) return;
+          task.slot.replaceChildren(el);
+          task.slot.classList.remove('is-pending');
+          task.slot.classList.add('is-loaded');
+        } finally {
+          this.inProgress.delete(task);
+        }
+      })
+    );
+
+    // If more visible uncached icons remain in viewport, pace the next batch gently
+    if (!this.disposed && this.visiblePending.size > 0) {
+      window.clearTimeout(this.batchTimer);
+      this.batchTimer = window.setTimeout(() => {
+        this.batchTimer = undefined;
+        void this.flushBatch();
+      }, 80);
+    }
+  }
+
+  cancelPending(): void {
+    window.clearTimeout(this.debounceTimer);
+    window.clearTimeout(this.batchTimer);
+    this.debounceTimer = undefined;
+    this.batchTimer = undefined;
+    this.visiblePending.clear();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.cancelPending();
+    this.observer?.disconnect();
+    this.observer = null;
+    this.slotToTask.clear();
+    this.inProgress.clear();
+  }
 }

@@ -2,7 +2,7 @@ import { fuzzyMatch } from './fuzzy';
 import { evaluateExpression, formatResult } from './calculator';
 import { convertToToman, parseConversionQuery } from './currency';
 import { ApiClient } from './api';
-import { hostOfUrl } from './constants';
+import { buildSearchUrl, getSearchEngine, hostOfUrl, type SearchEngineId } from './constants';
 import { isAIReady, parseNLCommand } from './ai';
 import {
   clipboardProviderFactory,
@@ -68,9 +68,14 @@ export const BUILT_IN_BANGS: BangDef[] = [
 ];
 
 const CUSTOM_BANGS_KEY = 'customBangs';
+let customBangsCache: BangDef[] = [];
+let customBangsLoaded = false;
 
 export async function getCustomBangs(): Promise<BangDef[]> {
-  return storage.get<BangDef[]>(CUSTOM_BANGS_KEY, []);
+  const list = await storage.get<BangDef[]>(CUSTOM_BANGS_KEY, []);
+  customBangsCache = list;
+  customBangsLoaded = true;
+  return list;
 }
 
 export async function saveCustomBang(bang: BangDef): Promise<void> {
@@ -85,15 +90,15 @@ export async function saveCustomBang(bang: BangDef): Promise<void> {
   const idx = all.findIndex((b) => b.short === cleanShort);
   if (idx >= 0) all[idx] = entry;
   else all.push(entry);
+  customBangsCache = all;
   await storage.set(CUSTOM_BANGS_KEY, all);
 }
 
 export async function deleteCustomBang(short: string): Promise<void> {
   const all = await getCustomBangs();
-  await storage.set(
-    CUSTOM_BANGS_KEY,
-    all.filter((b) => b.short !== short)
-  );
+  const next = all.filter((b) => b.short !== short);
+  customBangsCache = next;
+  await storage.set(CUSTOM_BANGS_KEY, next);
 }
 
 function resolveBang(short: string, custom: BangDef[]): BangDef | undefined {
@@ -102,6 +107,15 @@ function resolveBang(short: string, custom: BangDef[]): BangDef | undefined {
     custom.find((b) => b.short === lower) ||
     BUILT_IN_BANGS.find((b) => b.short === lower)
   );
+}
+
+export function looksLikeUrl(input: string): boolean {
+  const s = input.trim();
+  if (!s || /\s/.test(s)) return false;
+  if (/^https?:\/\//i.test(s)) return true;
+  if (/^localhost(:\d+)?(\/.*)?$/i.test(s)) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}(:\d+)?(\/.*)?$/.test(s)) return true;
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,}(?::\d+)?(?:\/.*)?$/i.test(s);
 }
 
 const navigate = (url: string): void => {
@@ -199,7 +213,7 @@ const calculatorProvider = (onCopy?: (label: string) => void): BarProvider => ({
 
 function parseReverseTomanQuery(input: string): { toman: number; target: 'usd' | 'gold' } | null {
   const s = input.trim().toLowerCase();
-  const m = s.match(/^([\d.,]+)\s*([km]?)\s*(?:t|toman|tomans|irt|تومان)\s*(?:to|in|=|به)\s*(usd|dollar|\$|gold|geram|طلا|دلار)$/);
+  const m = s.match(/^([\d.,]+)\s*([km]?)\s*(?:t|toman|tomans|irt|تومان)\s*(?:to|in|=|به)\s*(usdt|tether|usd|dollar|\$|gold|geram|طلا|دلار|تتر)$/);
   if (!m) return null;
   const base = parseFloat(m[1].replace(/,/g, ''));
   if (!Number.isFinite(base) || base <= 0) return null;
@@ -214,8 +228,9 @@ const currencyProvider = (onCopy?: (label: string) => void): BarProvider => ({
     const reverse = parseReverseTomanQuery(query);
     if (reverse) {
       const prices = await lastPrices();
-      const rawRate = reverse.target === 'usd' ? prices.usd.price : prices.gold.price;
-      const rateToman = rawRate !== 'Error' ? Number(rawRate.replace(/,/g, '')) / 10 : null;
+      const usdPrice = prices.usd?.price !== 'Error' ? prices.usd?.price : prices.usdt?.price;
+      const rawRate = reverse.target === 'usd' ? usdPrice : prices.gold?.price;
+      const rateToman = rawRate && rawRate !== 'Error' ? Number(rawRate.replace(/,/g, '')) / 10 : null;
       if (!rateToman || rateToman <= 0) {
         return [
           {
@@ -255,11 +270,11 @@ const currencyProvider = (onCopy?: (label: string) => void): BarProvider => ({
     if (!parsed) return [];
 
     const prices = await lastPrices();
-    const usd = prices.usd.price;
-    const gold = prices.gold.price;
+    const usd = prices.usd?.price !== 'Error' ? prices.usd?.price : prices.usdt?.price;
+    const gold = prices.gold?.price;
     const rates = {
-      usdToman: usd !== 'Error' ? Number(usd.replace(/,/g, '')) / 10 : null,
-      goldToman: gold !== 'Error' ? Number(gold.replace(/,/g, '')) / 10 : null
+      usdToman: usd && usd !== 'Error' ? Number(usd.replace(/,/g, '')) / 10 : null,
+      goldToman: gold && gold !== 'Error' ? Number(gold.replace(/,/g, '')) / 10 : null
     };
     const total = convertToToman(parsed, rates);
     const formatted = total !== null ? `${formatResult(total)} Toman` : 'Rate unavailable';
@@ -286,14 +301,14 @@ const currencyProvider = (onCopy?: (label: string) => void): BarProvider => ({
   }
 });
 
-let priceMemo: Awaited<ReturnType<typeof ApiClient.fetchPrices>> | null = null;
+let priceMemo: Partial<Record<'usd' | 'usdt' | 'gold', Awaited<ReturnType<typeof ApiClient.fetchAssetPrice>>>> | null = null;
 let priceMemoTimestamp = 0;
-const PRICE_MEMO_TTL = 5 * 60 * 1000;
+const PRICE_MEMO_TTL = 3 * 60 * 1000;
 
 async function lastPrices() {
   const now = Date.now();
   if (!priceMemo || now - priceMemoTimestamp > PRICE_MEMO_TTL) {
-    priceMemo = await ApiClient.fetchPrices();
+    priceMemo = await ApiClient.fetchPrices(['usd', 'usdt', 'gold']);
     priceMemoTimestamp = now;
   }
   return priceMemo;
@@ -398,21 +413,29 @@ const shortcutsProvider = (getShortcuts: () => Shortcut[]): BarProvider => ({
   }
 });
 
-// --- Google suggestions ---
+// --- Network Autocomplete Suggestions ---
 
-const suggestionsProvider = (): BarProvider => ({
+const suggestionsProvider = (
+  getEngine: () => { id: SearchEngineId; customUrl?: string }
+): BarProvider => ({
   id: 'suggestions',
   async search(query) {
     if (query.length < 2 || query.startsWith('>') || query.startsWith('!')) return [];
-    const results = await ApiClient.fetchSuggestions(query);
-    return results.slice(0, 4).map((text) => ({
-      id: `sugg:${text}`,
-      title: text,
-      hint: 'Google Search',
-      icon: 'search',
-      score: 40,
-      run: () => navigate(`https://www.google.com/search?q=${encodeURIComponent(text)}`)
-    }));
+    const cfg = getEngine();
+    const engine = getSearchEngine(cfg.id, cfg.customUrl);
+    const results = await ApiClient.fetchSuggestions(query, engine.id);
+    const lowerQ = query.trim().toLowerCase();
+    return results
+      .filter((text) => text.trim().toLowerCase() !== lowerQ)
+      .slice(0, 5)
+      .map((text, idx) => ({
+        id: `sugg:${text.toLowerCase()}`,
+        title: text,
+        hint: `${engine.name} Search`,
+        icon: 'search',
+        score: 52 - idx,
+        run: () => navigate(buildSearchUrl(cfg.id, text, cfg.customUrl))
+      }));
   }
 });
 
@@ -467,34 +490,62 @@ export interface MergedResults {
 export interface EngineOptions {
   historyEnabled?: () => boolean;
   clipboardEnabled?: () => boolean;
+  getSearchEngine?: () => { id: SearchEngineId; customUrl?: string };
   onCopy?: (label: string) => void;
 }
 
 export class CommandBarEngine {
   private providers: BarProvider[] = [];
+  private localAsyncProviders: BarProvider[] = [];
+  private networkProvider: BarProvider;
+  private getEngine: () => { id: SearchEngineId; customUrl?: string };
+  private calcProv: BarProvider;
+  private actionsProv: BarProvider;
+  private shortcutsProv: BarProvider;
+  private cmdPrefixProv: BarProvider;
 
   constructor(
     registry: ActionRegistry,
     getShortcuts: () => Shortcut[],
     options: EngineOptions = {}
   ) {
-    const { historyEnabled = () => false, clipboardEnabled = () => false, onCopy } = options;
+    const {
+      historyEnabled = () => false,
+      clipboardEnabled = () => false,
+      getSearchEngine: getEngineOpt = () => ({ id: 'google' as SearchEngineId }),
+      onCopy
+    } = options;
 
-    this.providers.push(
-      bangProvider(),
-      commandPrefixProvider(registry),
+    this.getEngine = getEngineOpt;
+    this.cmdPrefixProv = commandPrefixProvider(registry);
+    this.calcProv = calculatorProvider(onCopy);
+    this.actionsProv = actionsProvider(registry);
+    this.shortcutsProv = shortcutsProvider(getShortcuts);
+    this.networkProvider = suggestionsProvider(getEngineOpt);
+
+    this.localAsyncProviders = [
       tabsProvider(),
       bookmarksProvider(),
       topSitesProvider(),
       historyProviderFactory(historyEnabled),
       clipboardProviderFactory(clipboardEnabled),
-      calculatorProvider(onCopy),
       currencyProvider(onCopy),
-      actionsProvider(registry),
-      shortcutsProvider(getShortcuts),
-      suggestionsProvider(),
       aiNlProvider(registry)
+    ];
+
+    this.providers.push(
+      bangProvider(),
+      this.cmdPrefixProv,
+      ...this.localAsyncProviders,
+      this.calcProv,
+      this.actionsProv,
+      this.shortcutsProv,
+      this.networkProvider
     );
+
+    if (!customBangsLoaded) {
+      void getCustomBangs();
+    }
   }
 
   private static providerWeight(id: string): number {
@@ -524,61 +575,177 @@ export class CommandBarEngine {
     }
   }
 
+  private buildPrimarySearchItem(q: string): BarResult {
+    const cfg = this.getEngine();
+    const engine = getSearchEngine(cfg.id, cfg.customUrl);
+    if (looksLikeUrl(q)) {
+      const target = /^https?:\/\//i.test(q) ? q : `https://${q}`;
+      return {
+        id: 'primary:url',
+        title: `Open ${q}`,
+        hint: 'Direct URL',
+        kbd: '↵',
+        icon: 'shortcut',
+        score: 210,
+        run: () => navigate(target)
+      };
+    }
+    return {
+      id: 'primary:search',
+      title: q,
+      hint: `Search ${engine.name}`,
+      kbd: '↵',
+      icon: 'search',
+      score: 180,
+      run: () => navigate(buildSearchUrl(cfg.id, q, cfg.customUrl))
+    };
+  }
+
+  private searchBangsSync(q: string): BarResult[] {
+    if (!q.startsWith('!')) return [];
+    const custom = customBangsCache;
+    const allBangs = [...custom, ...BUILT_IN_BANGS.filter((b) => !custom.some((c) => c.short === b.short))];
+
+    if (q === '!' || (/^!\w+$/.test(q) && !resolveBang(q.slice(1), custom))) {
+      const prefix = q.slice(1).toLowerCase();
+      return allBangs
+        .filter((b) => !prefix || b.short.startsWith(prefix) || b.name.toLowerCase().includes(prefix))
+        .slice(0, 6)
+        .map((b, i) => ({
+          id: `bang-hint:${b.short}`,
+          title: `!${b.short} — ${b.name}`,
+          hint: 'Type query after bang',
+          kbd: `!${b.short}`,
+          icon: 'bang',
+          score: 950 - i,
+          run: () => navigate(b.urlTemplate.replace('%s', ''))
+        }));
+    }
+
+    const parsed = parseBangQuery(q, custom);
+    if (!parsed) return [];
+    const url = parsed.bang.urlTemplate.includes('%s')
+      ? parsed.bang.urlTemplate.replace('%s', encodeURIComponent(parsed.rest))
+      : parsed.bang.urlTemplate;
+    return [
+      {
+        id: `bang:${parsed.bang.short}`,
+        title: parsed.rest ? `Search ${parsed.bang.name}: ${parsed.rest}` : `Open ${parsed.bang.name}`,
+        hint: parsed.bang.name,
+        kbd: `!${parsed.bang.short}`,
+        icon: 'bang',
+        score: 1000,
+        run: () => navigate(url)
+      }
+    ];
+  }
+
+  /** Phase 1: 0ms synchronous search — instant feedback on every keystroke. */
+  searchInstant(query: string): MergedResults {
+    const q = query.trim();
+    if (!q) return { results: [], exclusive: false };
+
+    if (q.startsWith('!')) {
+      const bangRes = this.searchBangsSync(q);
+      if (bangRes.length > 0) return { results: bangRes.slice(0, 8), exclusive: true };
+    }
+    if (q.startsWith('>')) {
+      const cmdRes = this.cmdPrefixProv.search(q) as BarResult[];
+      if (cmdRes.length > 0) return { results: cmdRes.slice(0, 8), exclusive: true };
+    }
+
+    const items: BarResult[] = [this.buildPrimarySearchItem(q)];
+    const pushWeighted = (id: string, list: BarResult[]): void => {
+      const w = CommandBarEngine.providerWeight(id);
+      for (const r of list) items.push({ ...r, score: r.score + w });
+    };
+
+    pushWeighted('calculator', this.calcProv.search(q) as BarResult[]);
+    pushWeighted('shortcuts', this.shortcutsProv.search(q) as BarResult[]);
+    pushWeighted('actions', this.actionsProv.search(q) as BarResult[]);
+
+    const deduped = this.mergeLists([items]);
+    return { results: deduped.slice(0, 8), exclusive: false };
+  }
+
+  /** Phase 2a: fast local Chrome IPC + currency providers (no network autocomplete wait). */
+  async searchLocalAsync(query: string): Promise<BarResult[]> {
+    const q = query.trim();
+    if (!q || q.startsWith('!') || q.startsWith('>')) return [];
+    const settled = await Promise.all(
+      this.localAsyncProviders.map(async (p) => {
+        try {
+          const res = await p.search(q);
+          const w = CommandBarEngine.providerWeight(p.id);
+          return res.map((r) => ({ ...r, score: r.score + w }));
+        } catch {
+          return [] as BarResult[];
+        }
+      })
+    );
+    return this.mergeLists(settled);
+  }
+
+  /** Phase 2b: network autocomplete suggestions (cached or debounced). */
+  async searchNetworkSuggestions(query: string): Promise<BarResult[]> {
+    const q = query.trim();
+    if (q.length < 2 || q.startsWith('!') || q.startsWith('>') || looksLikeUrl(q)) return [];
+    try {
+      return await this.networkProvider.search(q);
+    } catch {
+      return [];
+    }
+  }
+
+  mergeLists(lists: BarResult[][]): BarResult[] {
+    const merged = new Map<string, BarResult>();
+    for (const list of lists) {
+      for (const r of list) {
+        const existing = merged.get(r.id);
+        if (!existing || existing.score < r.score) merged.set(r.id, r);
+      }
+    }
+    return Array.from(merged.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+  }
+
+  /** 0ms synchronous Enter resolver — never waits for network suggestions or debounces. */
+  resolveEnterAction(query: string): () => void {
+    const q = query.trim();
+    if (!q) return () => {};
+
+    if (q.startsWith('!')) {
+      const bangs = this.searchBangsSync(q);
+      if (bangs.length > 0) return bangs[0].run;
+    }
+
+    if (q.startsWith('>')) {
+      const cmds = this.cmdPrefixProv.search(q) as BarResult[];
+      if (cmds.length > 0) return cmds[0].run;
+    }
+
+    const calc = this.calcProv.search(q) as BarResult[];
+    if (calc.length > 0) return calc[0].run;
+
+    return this.buildPrimarySearchItem(q).run;
+  }
+
   async search(query: string): Promise<MergedResults> {
     const q = query.trim();
     if (!q) return { results: [], exclusive: false };
 
-    // Run exclusive providers first so !bang and >command stay focused
-    for (const p of this.providers) {
-      if (!p.exclusive) continue;
-      try {
-        const res = await p.search(q);
-        if (res.length > 0) {
-          return { results: res.slice(0, 8), exclusive: true };
-        }
-      } catch {
-        // continue
-      }
-    }
+    const instant = this.searchInstant(q);
+    if (instant.exclusive) return instant;
 
-    const settled = await Promise.all(
-      this.providers
-        .filter((p) => !p.exclusive)
-        .map(async (p) => {
-          try {
-            return { provider: p.id, results: await p.search(q) };
-          } catch {
-            return { provider: p.id, results: [] as BarResult[] };
-          }
-        })
-    );
+    const [local, net] = await Promise.all([
+      this.searchLocalAsync(q),
+      this.searchNetworkSuggestions(q)
+    ]);
 
-    const merged = new Map<string, BarResult>();
-    for (const s of settled) {
-      const weight = CommandBarEngine.providerWeight(s.provider);
-      for (const r of s.results) {
-        const weighted = { ...r, score: r.score + weight };
-        const existing = merged.get(r.id);
-        if (!existing || existing.score < weighted.score) merged.set(r.id, weighted);
-      }
-    }
-
-    const results = Array.from(merged.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 8);
-
-    if (results.length === 0) {
-      results.push({
-        id: 'fallback:google',
-        title: q,
-        hint: 'Search Google',
-        kbd: '↵',
-        icon: 'search',
-        score: 0,
-        run: () => navigate(`https://www.google.com/search?q=${encodeURIComponent(q)}`)
-      });
-    }
-
-    return { results, exclusive: false };
+    return {
+      results: this.mergeLists([instant.results, local, net]),
+      exclusive: false
+    };
   }
 }

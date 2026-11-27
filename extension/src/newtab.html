@@ -12,9 +12,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link id="google-fonts-link" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;700&family=Geist:wght@300;400;500;600;700&display=swap" rel="stylesheet" media="print">
-  <script type="module" crossorigin src="/assets/newtab.html-BQfmuOQA.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/constants-iHRlotly.js">
-  <link rel="stylesheet" crossorigin href="/assets/newtab-C_KtMJxM.css">
+  <script type="module" crossorigin src="/assets/newtab.html-BuTZJenC.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/constants-C7Koxfoo.js">
+  <link rel="stylesheet" crossorigin href="/assets/newtab-B_MxIa6O.css">
 </head>
 
 <body>
@@ -67,6 +67,7 @@
             aria-autocomplete="list"
             aria-controls="search-suggestions"
           >
+          <span class="command-loading-spinner" id="command-loading-spinner" aria-hidden="true"></span>
           <kbd class="command-slash-hint" aria-hidden="true">/</kbd>
         </div>
         <div id="search-suggestions" class="suggestions-container" role="listbox" aria-label="Command results"></div>
@@ -94,9 +95,9 @@
       <section class="telemetry-block telemetry-block--interactive" id="price-widget" role="button" tabindex="0" title="Open Market Pulse in Workspace Deck">
         <div class="pane-label">Market.Volatility</div>
         <div class="big-num" id="price-usd-big">---</div>
-        <div class="data-sublabel">USD / Toman Exchange</div>
-        <span class="price-item" id="price-usd">USD —</span>
-        <span class="price-item" id="price-gold">GOLD —</span>
+        <div class="data-sublabel" id="price-spotlight-label">USDT / Toman Live (24/7)</div>
+        <div class="price-list" id="price-list"></div>
+        <span class="price-source-meta" id="price-source-meta"></span>
       </section>
 
       <section class="telemetry-block">

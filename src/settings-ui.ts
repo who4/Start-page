@@ -1,6 +1,15 @@
 import { clearClipboardHistory } from './chrome-providers';
 import { BUILT_IN_BANGS, deleteCustomBang, getCustomBangs, saveCustomBang } from './commandbar';
-import { FINANCE_ASSETS, getNewsSource, NEWS_SOURCES, type FinanceAssetId } from './constants';
+import {
+  FINANCE_ASSETS,
+  getNewsSource,
+  getSearchEngine,
+  NEWS_SOURCES,
+  SEARCH_ENGINES,
+  type FinanceAssetId,
+  type MarketProviderId,
+  type SearchEngineId
+} from './constants';
 import { isWidgetEnabled, registry, setWidgetEnabled } from './grid';
 import { t } from './i18n';
 import { DEFAULT_SETTINGS, storage } from './storage';
@@ -32,19 +41,61 @@ export const ACCENTS: AccentDef[] = [
   { name: 'rose', color: 'rgba(239, 68, 68, 0.16)', text: '#EF4444' }
 ];
 
-type SectionId = 'general' | 'appearance' | 'commands' | 'modules' | 'privacy';
+export type SettingsSectionId =
+  | 'search'
+  | 'commands'
+  | 'clock'
+  | 'weather'
+  | 'markets'
+  | 'news'
+  | 'themes'
+  | 'layout'
+  | 'modules'
+  | 'privacy'
+  | 'backup';
 
-interface Section {
-  id: SectionId;
+interface NavSection {
+  id: SettingsSectionId;
   label: string;
 }
 
-const SECTIONS: Section[] = [
-  { id: 'general', label: 'General & Feeds' },
-  { id: 'appearance', label: 'Themes & Layout' },
-  { id: 'modules', label: 'Widgets & Modules' },
-  { id: 'commands', label: 'Commands & Bangs' },
-  { id: 'privacy', label: 'Privacy & Backup' }
+interface NavGroup {
+  label: string;
+  items: NavSection[];
+}
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: 'Search & Commands',
+    items: [
+      { id: 'search', label: 'Search Engine' },
+      { id: 'commands', label: 'Commands & Bangs' }
+    ]
+  },
+  {
+    label: 'Feeds & Clock',
+    items: [
+      { id: 'clock', label: 'Clock & Workspace' },
+      { id: 'weather', label: 'Weather' },
+      { id: 'markets', label: 'Markets' },
+      { id: 'news', label: 'Live Wire News' }
+    ]
+  },
+  {
+    label: 'Appearance',
+    items: [
+      { id: 'themes', label: 'Themes & Colors' },
+      { id: 'layout', label: 'Layout & Bookmarks' },
+      { id: 'modules', label: 'Widgets & Modules' }
+    ]
+  },
+  {
+    label: 'System',
+    items: [
+      { id: 'privacy', label: 'Privacy' },
+      { id: 'backup', label: 'Backup & Reset' }
+    ]
+  }
 ];
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -68,8 +119,8 @@ export class SettingsUI {
   private settings: Settings;
   private modal: HTMLElement;
   private contentArea!: HTMLElement;
-  private navButtons = new Map<SectionId, HTMLElement>();
-  private activeSection: SectionId = 'general';
+  private navButtons = new Map<SettingsSectionId, HTMLElement>();
+  private activeSection: SettingsSectionId = 'search';
 
   constructor(settings: Settings, private callbacks: SettingsUICallbacks) {
     this.settings = structuredClone(settings);
@@ -86,7 +137,7 @@ export class SettingsUI {
     if (this.isOpen) void this.render();
   }
 
-  async open(section?: SectionId): Promise<void> {
+  async open(section?: SettingsSectionId): Promise<void> {
     if (section) this.activeSection = section;
     this.modal.style.display = 'flex';
     await this.render();
@@ -116,16 +167,27 @@ export class SettingsUI {
     const sidebar = el('nav', 'settings-sidebar');
     sidebar.setAttribute('aria-label', t('settings'));
 
-    for (const section of SECTIONS) {
-      const btn = el('button', 'settings-nav-item', section.label);
-      btn.type = 'button';
-      btn.dataset.section = section.id;
-      btn.addEventListener('click', () => {
-        this.activeSection = section.id;
-        void this.render();
-      });
-      this.navButtons.set(section.id, btn);
-      sidebar.appendChild(btn);
+    for (const group of NAV_GROUPS) {
+      const groupWrap = el('div', 'settings-nav-group');
+      const groupLabel = el('div', 'settings-nav-group-label', group.label);
+      groupWrap.appendChild(groupLabel);
+
+      const groupList = el('div', 'settings-nav-list');
+      for (const section of group.items) {
+        const btn = el('button', 'settings-nav-item', section.label);
+        btn.type = 'button';
+        btn.dataset.section = section.id;
+        btn.addEventListener('click', () => {
+          this.activeSection = section.id;
+          this.contentArea.scrollTop = 0;
+          void this.render();
+        });
+        this.navButtons.set(section.id, btn);
+        groupList.appendChild(btn);
+      }
+
+      groupWrap.appendChild(groupList);
+      sidebar.appendChild(groupWrap);
     }
 
     this.contentArea = el('div', 'settings-panel');
@@ -140,25 +202,45 @@ export class SettingsUI {
 
   private async render(): Promise<void> {
     this.navButtons.forEach((btn, id) => {
-      btn.classList.toggle('active', id === this.activeSection);
+      const isActive = id === this.activeSection;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-current', isActive ? 'page' : 'false');
     });
     this.contentArea.replaceChildren();
 
     switch (this.activeSection) {
-      case 'general':
-        this.renderGeneral();
-        break;
-      case 'appearance':
-        this.renderAppearance();
+      case 'search':
+        this.renderSearch();
         break;
       case 'commands':
         await this.renderCommands();
+        break;
+      case 'clock':
+        this.renderClockWorkspace();
+        break;
+      case 'weather':
+        this.renderWeather();
+        break;
+      case 'markets':
+        this.renderMarkets();
+        break;
+      case 'news':
+        this.renderNews();
+        break;
+      case 'themes':
+        this.renderThemes();
+        break;
+      case 'layout':
+        this.renderLayout();
         break;
       case 'modules':
         await this.renderModules();
         break;
       case 'privacy':
         this.renderPrivacy();
+        break;
+      case 'backup':
+        this.renderBackup();
         break;
     }
   }
@@ -167,6 +249,22 @@ export class SettingsUI {
     partial(this.settings);
     await this.callbacks.onChange(structuredClone(this.settings));
     await this.render();
+  }
+
+  private buildPanelHeader(title: string, subtitle: string): HTMLElement {
+    const head = el('div', 'settings-panel-header');
+    head.appendChild(el('h3', 'settings-panel-title', title));
+    head.appendChild(el('p', 'settings-panel-subtitle', subtitle));
+    return head;
+  }
+
+  private buildSubSection(labelText: string, ...children: HTMLElement[]): HTMLElement {
+    const block = el('section', 'settings-subsection');
+    block.appendChild(el('div', 'settings-subsection-label', labelText));
+    const stack = el('div', 'settings-subsection-body');
+    stack.append(...children);
+    block.appendChild(stack);
+    return block;
   }
 
   private buildToggle(labelText: string, value: boolean, onToggle: () => void): HTMLElement {
@@ -205,9 +303,248 @@ export class SettingsUI {
     return group;
   }
 
-  // --- Tab 1: General & Weather ---
-  private renderGeneral(): void {
-    // Weather location (any city worldwide + GPS)
+  // --- Search & Commands: Search Engine ---
+  private renderSearch(): void {
+    const header = this.buildPanelHeader(
+      'Search Engine',
+      'Choose where web queries open when you press Enter in the command bar.'
+    );
+
+    const searchEngineGroup = el('div', 'form-group');
+    searchEngineGroup.appendChild(el('label', undefined, 'Default provider'));
+    const activeEngineId: SearchEngineId = this.settings.general.searchEngine || 'google';
+    const engineRow = el('div', 'seg-row');
+
+    for (const eng of SEARCH_ENGINES) {
+      const btn = el('button', 'seg-btn' + (activeEngineId === eng.id ? ' active' : ''), eng.name);
+      btn.type = 'button';
+      btn.addEventListener('click', () => {
+        void this.update((s) => {
+          s.general.searchEngine = eng.id;
+        });
+        this.callbacks.onToast?.(`Search engine set to ${eng.name}`);
+      });
+      engineRow.appendChild(btn);
+    }
+
+    const customEngineBtn = el(
+      'button',
+      'seg-btn' + (activeEngineId === 'custom' ? ' active' : ''),
+      'Custom URL'
+    );
+    customEngineBtn.type = 'button';
+    customEngineBtn.addEventListener('click', () =>
+      void this.update((s) => {
+        s.general.searchEngine = 'custom';
+      })
+    );
+    engineRow.appendChild(customEngineBtn);
+    searchEngineGroup.appendChild(engineRow);
+
+    if (activeEngineId === 'custom') {
+      const customSearchForm = el('form', 'news-custom-row');
+      const customSearchIn = el('input', 'hw-input-sm');
+      customSearchIn.type = 'text';
+      customSearchIn.placeholder = 'https://search.example.com/?q=%s';
+      customSearchIn.value = this.settings.general.customSearchUrl ?? '';
+
+      const applyEngineBtn = el('button', 'hw-mini-btn is-accent', 'Apply');
+      applyEngineBtn.type = 'submit';
+      customSearchForm.append(customSearchIn, applyEngineBtn);
+
+      customSearchForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const val = customSearchIn.value.trim();
+        if (!val) return;
+        void this.update((s) => {
+          s.general.searchEngine = 'custom';
+          s.general.customSearchUrl = val;
+        });
+        this.callbacks.onToast?.('Custom search engine saved');
+      });
+      searchEngineGroup.appendChild(customSearchForm);
+    }
+
+    const activeEngineDef = getSearchEngine(activeEngineId, this.settings.general.customSearchUrl);
+    searchEngineGroup.appendChild(
+      el(
+        'div',
+        'settings-note',
+        activeEngineId === 'custom'
+          ? 'Use %s where the search query goes (e.g. https://kagi.com/search?q=%s).'
+          : `Active: ${activeEngineDef.name} — type and hit Enter to search immediately, or use !g / !d / !gh bangs anytime.`
+      )
+    );
+
+    this.contentArea.append(header, searchEngineGroup);
+  }
+
+  // --- Search & Commands: Commands & Custom Bangs ---
+  private async renderCommands(): Promise<void> {
+    const header = this.buildPanelHeader(
+      'Commands & Bangs',
+      'Create quick !bang shortcuts for searching your favorite sites directly.'
+    );
+    const customBangs = await getCustomBangs();
+
+    const addGroup = el('div', 'form-group');
+    addGroup.appendChild(el('label', undefined, 'Add custom !bang shortcut'));
+
+    const form = el('form', 'bang-form');
+    const shortIn = el('input', 'hw-input-sm');
+    shortIn.placeholder = 'mdn';
+    shortIn.maxLength = 12;
+    shortIn.required = true;
+
+    const nameIn = el('input', 'hw-input-sm');
+    nameIn.placeholder = 'MDN Docs';
+    nameIn.required = true;
+
+    const urlIn = el('input', 'hw-input-sm bang-url-input');
+    urlIn.placeholder = 'https://developer.mozilla.org/en-US/search?q=%s';
+    urlIn.required = true;
+
+    const submit = el('button', 'hw-mini-btn is-accent', 'Add');
+    submit.type = 'submit';
+
+    form.append(shortIn, nameIn, urlIn, submit);
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await saveCustomBang({
+        short: shortIn.value,
+        name: nameIn.value,
+        urlTemplate: urlIn.value
+      });
+      this.callbacks.onToast?.(`Saved !${shortIn.value.replace(/^!+/, '').trim()} bang`);
+      await this.render();
+    });
+    addGroup.appendChild(form);
+
+    const customGroup = el('div', 'form-group');
+    if (customBangs.length === 0) {
+      customGroup.appendChild(
+        el('div', 'settings-note', 'No custom bangs yet. Use %s where the search query goes.')
+      );
+    } else {
+      const list = el('div', 'bang-list');
+      for (const b of customBangs) {
+        const row = el('div', 'bang-row');
+        row.appendChild(el('span', 'bang-code', `!${b.short}`));
+        row.appendChild(el('span', 'bang-name', `${b.name} · ${b.urlTemplate}`));
+        const del = el('button', 'hw-mini-btn', '×');
+        del.type = 'button';
+        del.setAttribute('aria-label', `Delete !${b.short}`);
+        del.addEventListener('click', async () => {
+          await deleteCustomBang(b.short);
+          await this.render();
+        });
+        row.appendChild(del);
+        list.appendChild(row);
+      }
+      customGroup.appendChild(list);
+    }
+
+    const refList = el('div', 'bang-list');
+    for (const b of BUILT_IN_BANGS) {
+      const row = el('div', 'bang-row');
+      row.appendChild(el('span', 'bang-code', `!${b.short}`));
+      row.appendChild(el('span', 'bang-name', b.name));
+      refList.appendChild(row);
+    }
+
+    this.contentArea.append(
+      header,
+      this.buildSubSection('Custom Shortcuts', addGroup, customGroup),
+      this.buildSubSection('Built-in Reference', refList)
+    );
+  }
+
+  // --- Feeds & Clock: Clock & Workspace ---
+  private renderClockWorkspace(): void {
+    const header = this.buildPanelHeader(
+      'Clock & Workspace',
+      'Configure time formatting, calendar display, and workspace behavior.'
+    );
+
+    const calGroup = this.buildSegGroup(
+      t('calendar'),
+      this.settings.general.calendar,
+      [
+        ['gregorian', t('gregorian')],
+        ['jalali', t('jalali')]
+      ] as const,
+      (value) =>
+        void this.update((s) => {
+          s.general.calendar = value;
+        })
+    );
+
+    const clockGroup = el('div', 'form-group');
+    clockGroup.appendChild(el('label', undefined, t('clockFormat')));
+    const clockRow = el('div', 'seg-row');
+    for (const [is24, key] of [
+      [true, 'clock24h'],
+      [false, 'clock12h']
+    ] as const) {
+      const btn = el(
+        'button',
+        'seg-btn' + (this.settings.general.clock24h === is24 ? ' active' : ''),
+        t(key)
+      );
+      btn.type = 'button';
+      btn.addEventListener('click', () =>
+        void this.update((s) => {
+          s.general.clock24h = is24;
+        })
+      );
+      clockRow.appendChild(btn);
+    }
+    clockGroup.appendChild(clockRow);
+
+    const secondsToggle = this.buildToggle(t('showSeconds'), this.settings.general.showSeconds, () =>
+      void this.update((s) => {
+        s.general.showSeconds = !s.general.showSeconds;
+      })
+    );
+
+    const dualDateToggle = this.buildToggle(t('showDualDate'), this.settings.general.showDualDate, () =>
+      void this.update((s) => {
+        s.general.showDualDate = !s.general.showDualDate;
+      })
+    );
+
+    const focusToggle = this.buildToggle(
+      'Show Daily Focus input in left pane',
+      this.settings.general.showDailyFocus ?? true,
+      () =>
+        void this.update((s) => {
+          s.general.showDailyFocus = !(s.general.showDailyFocus ?? true);
+        })
+    );
+
+    const rememberDrawerToggle = this.buildToggle(
+      t('rememberDrawer'),
+      this.settings.general.rememberDrawerState,
+      () =>
+        void this.update((s) => {
+          s.general.rememberDrawerState = !s.general.rememberDrawerState;
+        })
+    );
+
+    this.contentArea.append(
+      header,
+      this.buildSubSection('Clock & Calendar', calGroup, clockGroup, secondsToggle, dualDateToggle),
+      this.buildSubSection('Workspace Behavior', focusToggle, rememberDrawerToggle)
+    );
+  }
+
+  // --- Feeds & Clock: Weather ---
+  private renderWeather(): void {
+    const header = this.buildPanelHeader(
+      'Weather',
+      'Set your city or local GPS coordinates and measurement units.'
+    );
+
     const weatherGroup = el('div', 'form-group');
     weatherGroup.appendChild(el('label', undefined, 'Weather city (worldwide)'));
 
@@ -248,9 +585,109 @@ export class SettingsUI {
         })
     );
 
-    // Live Wire News Source selector (includes www.iranmonitor.org + custom RSS/site)
+    this.contentArea.append(header, weatherGroup, unitGroup);
+  }
+
+  // --- Feeds & Clock: Markets ---
+  private renderMarkets(): void {
+    const header = this.buildPanelHeader(
+      'Markets',
+      'Choose your live rate feeds, tracked tickers, and primary spotlight asset.'
+    );
+
+    const marketProviderGroup = this.buildSegGroup<MarketProviderId>(
+      'Market data source',
+      this.settings.finance.provider ?? 'auto',
+      [
+        ['auto', 'Auto (AlanChand + Nobitex)'],
+        ['alanchand', 'AlanChand (All)'],
+        ['wallex', 'Wallex + AlanChand'],
+        ['tgju', 'TGJU (Bazaar)']
+      ],
+      (provider) => {
+        void this.update((s) => {
+          s.finance.provider = provider;
+        });
+        const label =
+          provider === 'auto'
+            ? 'AlanChand + Nobitex'
+            : provider === 'alanchand'
+            ? 'AlanChand'
+            : provider === 'wallex'
+            ? 'Wallex + AlanChand'
+            : 'TGJU';
+        this.callbacks.onToast?.(`Market source set to ${label}`);
+      }
+    );
+    marketProviderGroup.appendChild(
+      el(
+        'div',
+        'settings-note',
+        'AlanChand & TGJU provide live Tehran USD, Gold 18K, and EUR rates; Nobitex & Wallex supply 24/7 USDT/Toman, BTC, and ETH feeds.'
+      )
+    );
+
+    const trackedTickersGroup = el('div', 'form-group');
+    trackedTickersGroup.appendChild(el('label', undefined, 'Tracked market tickers'));
+    const trackedRow = el('div', 'seg-row');
+    const allAssetIds = Object.keys(FINANCE_ASSETS) as FinanceAssetId[];
+    for (const assetId of allAssetIds) {
+      const def = FINANCE_ASSETS[assetId];
+      const active = this.settings.finance.assets.includes(assetId);
+      const btn = el('button', 'seg-btn' + (active ? ' active' : ''), `${def.code} · ${def.name}`);
+      btn.type = 'button';
+      btn.addEventListener('click', () =>
+        void this.update((s) => {
+          const exists = s.finance.assets.includes(assetId);
+          if (exists && s.finance.assets.length > 1) {
+            s.finance.assets = s.finance.assets.filter((id) => id !== assetId);
+            if (s.finance.spotlight === assetId) {
+              s.finance.spotlight = s.finance.assets[0];
+            }
+          } else if (!exists) {
+            s.finance.assets = [...s.finance.assets, assetId];
+          }
+        })
+      );
+      trackedRow.appendChild(btn);
+    }
+    trackedTickersGroup.appendChild(trackedRow);
+
+    const enabledAssets = this.settings.finance.assets.filter(
+      (id): id is FinanceAssetId => id in FINANCE_ASSETS
+    );
+    const activeSpotlight: FinanceAssetId =
+      enabledAssets.includes(this.settings.finance.spotlight)
+        ? this.settings.finance.spotlight
+        : enabledAssets[0] ?? 'usdt';
+    const spotlightGroup = this.buildSegGroup<FinanceAssetId>(
+      'Hero spotlight ticker',
+      activeSpotlight,
+      (enabledAssets.length > 0 ? enabledAssets : (['usdt'] as FinanceAssetId[])).map(
+        (id) => [id, FINANCE_ASSETS[id].code] as const
+      ),
+      (spot) =>
+        void this.update((s) => {
+          s.finance.spotlight = spot;
+        })
+    );
+
+    this.contentArea.append(
+      header,
+      this.buildSubSection('Data Feed', marketProviderGroup),
+      this.buildSubSection('Tickers & Spotlight', trackedTickersGroup, spotlightGroup)
+    );
+  }
+
+  // --- Feeds & Clock: Live Wire News ---
+  private renderNews(): void {
+    const header = this.buildPanelHeader(
+      'Live Wire News',
+      'Select your headline source and optionally filter stories by keywords.'
+    );
+
     const newsGroup = el('div', 'form-group');
-    newsGroup.appendChild(el('label', undefined, 'News source (Live Wire)'));
+    newsGroup.appendChild(el('label', undefined, 'News source'));
     const activeSourceId = this.settings.news?.sourceId || 'bbc-world';
 
     const newsRow = el('div', 'seg-row');
@@ -321,20 +758,20 @@ export class SettingsUI {
     }
 
     const activeNewsDef = getNewsSource(activeSourceId);
-    const newsMeta = el(
-      'div',
-      'settings-note',
-      activeSourceId === 'custom'
-        ? this.settings.news?.customUrl
-          ? `Active custom source: ${this.settings.news.customUrl}`
-          : 'Enter any RSS/Atom URL or website domain above.'
-        : `Active: ${activeNewsDef.name} (${activeNewsDef.domain})`
+    newsGroup.appendChild(
+      el(
+        'div',
+        'settings-note',
+        activeSourceId === 'custom'
+          ? this.settings.news?.customUrl
+            ? `Active custom source: ${this.settings.news.customUrl}`
+            : 'Enter any RSS/Atom URL or website domain above.'
+          : `Active: ${activeNewsDef.name} (${activeNewsDef.domain})`
+      )
     );
-    newsGroup.appendChild(newsMeta);
 
-    // News keyword filter (only show headlines containing at least one keyword)
     const keywordGroup = el('div', 'form-group');
-    keywordGroup.appendChild(el('label', undefined, 'News keyword filter'));
+    keywordGroup.appendChild(el('label', undefined, 'Keyword filter'));
 
     const kwForm = el('form', 'news-custom-row');
     const kwInput = el('input', 'hw-input-sm');
@@ -424,83 +861,20 @@ export class SettingsUI {
       )
     );
 
-    const calGroup = this.buildSegGroup(
-      t('calendar'),
-      this.settings.general.calendar,
-      [
-        ['gregorian', t('gregorian')],
-        ['jalali', t('jalali')]
-      ] as const,
-      (value) =>
-        void this.update((s) => {
-          s.general.calendar = value;
-        })
-    );
-
-    const clockGroup = el('div', 'form-group');
-    clockGroup.appendChild(el('label', undefined, t('clockFormat')));
-    const clockRow = el('div', 'seg-row');
-    for (const [is24, key] of [
-      [true, 'clock24h'],
-      [false, 'clock12h']
-    ] as const) {
-      const btn = el('button', 'seg-btn' + (this.settings.general.clock24h === is24 ? ' active' : ''), t(key));
-      btn.type = 'button';
-      btn.addEventListener('click', () =>
-        void this.update((s) => {
-          s.general.clock24h = is24;
-        })
-      );
-      clockRow.appendChild(btn);
-    }
-    clockGroup.appendChild(clockRow);
-
-    const secondsToggle = this.buildToggle(t('showSeconds'), this.settings.general.showSeconds, () =>
-      void this.update((s) => {
-        s.general.showSeconds = !s.general.showSeconds;
-      })
-    );
-
-    const dualDateToggle = this.buildToggle(t('showDualDate'), this.settings.general.showDualDate, () =>
-      void this.update((s) => {
-        s.general.showDualDate = !s.general.showDualDate;
-      })
-    );
-
-    const focusToggle = this.buildToggle(
-      'Show Daily Focus input in left pane',
-      this.settings.general.showDailyFocus ?? true,
-      () =>
-        void this.update((s) => {
-          s.general.showDailyFocus = !(s.general.showDailyFocus ?? true);
-        })
-    );
-
-    const rememberDrawerToggle = this.buildToggle(
-      t('rememberDrawer'),
-      this.settings.general.rememberDrawerState,
-      () =>
-        void this.update((s) => {
-          s.general.rememberDrawerState = !s.general.rememberDrawerState;
-        })
-    );
-
     this.contentArea.append(
-      weatherGroup,
-      unitGroup,
-      newsGroup,
-      keywordGroup,
-      calGroup,
-      clockGroup,
-      secondsToggle,
-      dualDateToggle,
-      focusToggle,
-      rememberDrawerToggle
+      header,
+      this.buildSubSection('Feed Source', newsGroup),
+      this.buildSubSection('Story Filtering', keywordGroup)
     );
   }
 
-  // --- Tab 2: Themes & Layout ---
-  private renderAppearance(): void {
+  // --- Appearance: Themes & Colors ---
+  private renderThemes(): void {
+    const header = this.buildPanelHeader(
+      'Themes & Colors',
+      'Switch between curated palettes or override accent and canvas colors.'
+    );
+
     const presetGroup = el('div', 'form-group');
     presetGroup.appendChild(el('label', undefined, t('themePreset')));
 
@@ -533,7 +907,6 @@ export class SettingsUI {
     }
     presetGroup.appendChild(grid);
 
-    // Custom accent override
     const accentGroup = el('div', 'form-group');
     accentGroup.appendChild(el('label', undefined, t('accentColor')));
 
@@ -565,7 +938,6 @@ export class SettingsUI {
     accentRow.append(picker, statusText, resetBtn);
     accentGroup.appendChild(accentRow);
 
-    // Custom canvas background override
     const bgGroup = el('div', 'form-group');
     bgGroup.appendChild(el('label', undefined, 'Custom canvas background'));
 
@@ -597,7 +969,20 @@ export class SettingsUI {
     bgRow.append(bgPicker, bgStatus, bgReset);
     bgGroup.appendChild(bgRow);
 
-    // Clock scale
+    this.contentArea.append(
+      header,
+      presetGroup,
+      this.buildSubSection('Color Overrides', accentGroup, bgGroup)
+    );
+  }
+
+  // --- Appearance: Layout & Bookmarks ---
+  private renderLayout(): void {
+    const header = this.buildPanelHeader(
+      'Layout & Bookmarks',
+      'Tune clock proportions, density, scrollbar styling, and bookmark presentation.'
+    );
+
     const clockScaleGroup = this.buildSegGroup<ClockScale>(
       'Clock size',
       this.settings.appearance.clockScale || 'standard',
@@ -612,7 +997,6 @@ export class SettingsUI {
         })
     );
 
-    // Layout density
     const densityGroup = this.buildSegGroup<LayoutDensity>(
       'Interface density',
       this.settings.appearance.density || 'standard',
@@ -627,7 +1011,20 @@ export class SettingsUI {
         })
     );
 
-    // Bookmark icon style
+    const scrollbarGroup = this.buildSegGroup<ScrollbarStyle>(
+      'Scrollbar style',
+      this.settings.appearance.scrollbarStyle || 'thin',
+      [
+        ['thin', 'Minimal Thin'],
+        ['accent', 'Accent Tint'],
+        ['hidden', 'Hidden']
+      ],
+      (style) =>
+        void this.update((s) => {
+          s.appearance.scrollbarStyle = style;
+        })
+    );
+
     const iconGroup = this.buildSegGroup<BookmarkIconStyle>(
       'Bookmark favicons',
       this.settings.appearance.bookmarkIconStyle || 'dithered',
@@ -641,21 +1038,6 @@ export class SettingsUI {
       (style) =>
         void this.update((s) => {
           s.appearance.bookmarkIconStyle = style;
-        })
-    );
-
-    // Custom scrollbar appearance
-    const scrollbarGroup = this.buildSegGroup<ScrollbarStyle>(
-      'Scrollbar style',
-      this.settings.appearance.scrollbarStyle || 'thin',
-      [
-        ['thin', 'Minimal Thin'],
-        ['accent', 'Accent Tint'],
-        ['hidden', 'Hidden']
-      ],
-      (style) =>
-        void this.update((s) => {
-          s.appearance.scrollbarStyle = style;
         })
     );
 
@@ -678,124 +1060,41 @@ export class SettingsUI {
     );
 
     this.contentArea.append(
-      presetGroup,
-      accentGroup,
-      bgGroup,
-      clockScaleGroup,
-      densityGroup,
-      iconGroup,
-      scrollbarGroup,
-      hostsToggle,
-      indicesToggle
+      header,
+      this.buildSubSection('Sizing & Chrome', clockScaleGroup, densityGroup, scrollbarGroup),
+      this.buildSubSection('Bookmarks List', iconGroup, hostsToggle, indicesToggle)
     );
   }
 
-  // --- Tab 3: Commands & Custom Bangs ---
-  private async renderCommands(): Promise<void> {
-    const customBangs = await getCustomBangs();
-
-    const addGroup = el('div', 'form-group');
-    addGroup.appendChild(el('label', undefined, 'Add custom !bang shortcut'));
-
-    const form = el('form', 'bang-form');
-    const shortIn = el('input', 'hw-input-sm');
-    shortIn.placeholder = 'mdn';
-    shortIn.maxLength = 12;
-    shortIn.required = true;
-
-    const nameIn = el('input', 'hw-input-sm');
-    nameIn.placeholder = 'MDN Docs';
-    nameIn.required = true;
-
-    const urlIn = el('input', 'hw-input-sm bang-url-input');
-    urlIn.placeholder = 'https://developer.mozilla.org/en-US/search?q=%s';
-    urlIn.required = true;
-
-    const submit = el('button', 'hw-mini-btn is-accent', 'Add');
-    submit.type = 'submit';
-
-    form.append(shortIn, nameIn, urlIn, submit);
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      await saveCustomBang({
-        short: shortIn.value,
-        name: nameIn.value,
-        urlTemplate: urlIn.value
-      });
-      this.callbacks.onToast?.(`Saved !${shortIn.value.replace(/^!+/, '').trim()} bang`);
-      await this.render();
-    });
-    addGroup.appendChild(form);
-
-    // Custom bangs list
-    const customGroup = el('div', 'form-group');
-    customGroup.appendChild(el('label', undefined, 'Custom bangs'));
-    if (customBangs.length === 0) {
-      customGroup.appendChild(el('div', 'settings-note', 'No custom bangs yet. Use %s where the search query goes.'));
-    } else {
-      const list = el('div', 'bang-list');
-      for (const b of customBangs) {
-        const row = el('div', 'bang-row');
-        row.appendChild(el('span', 'bang-code', `!${b.short}`));
-        row.appendChild(el('span', 'bang-name', `${b.name} · ${b.urlTemplate}`));
-        const del = el('button', 'hw-mini-btn', '×');
-        del.type = 'button';
-        del.addEventListener('click', async () => {
-          await deleteCustomBang(b.short);
-          await this.render();
-        });
-        row.appendChild(del);
-        list.appendChild(row);
-      }
-      customGroup.appendChild(list);
-    }
-
-    // Built-in bangs reference
-    const builtInGroup = el('div', 'form-group');
-    builtInGroup.appendChild(el('label', undefined, 'Built-in bangs'));
-    const refList = el('div', 'bang-list');
-    for (const b of BUILT_IN_BANGS) {
-      const row = el('div', 'bang-row');
-      row.appendChild(el('span', 'bang-code', `!${b.short}`));
-      row.appendChild(el('span', 'bang-name', b.name));
-      refList.appendChild(row);
-    }
-    builtInGroup.appendChild(refList);
-
-    this.contentArea.append(addGroup, customGroup, builtInGroup);
-  }
-
-  // --- Tab 4: Widgets & Modules ---
+  // --- Appearance: Widgets & Modules ---
   private async renderModules(): Promise<void> {
-    const rightPaneGroup = el('div', 'form-group');
-    rightPaneGroup.appendChild(el('label', undefined, 'Right pane live telemetry'));
-    rightPaneGroup.appendChild(
+    const header = this.buildPanelHeader(
+      'Widgets & Modules',
+      'Toggle right-pane live blocks and modules inside the Workspace Deck.'
+    );
+
+    const rightToggles: HTMLElement[] = [
       this.buildToggle('Atmosphere (Weather & AQI)', this.settings.widgets.weather ?? true, () =>
         void this.update((s) => {
           s.widgets.weather = !(s.widgets.weather ?? true);
         })
-      )
-    );
-    rightPaneGroup.appendChild(
-      this.buildToggle('Market Volatility (USD & Gold)', this.settings.widgets.priceTicker, () =>
+      ),
+      this.buildToggle('Market Volatility (Live Tickers)', this.settings.widgets.priceTicker, () =>
         void this.update((s) => {
           s.widgets.priceTicker = !s.widgets.priceTicker;
         })
-      )
-    );
-    rightPaneGroup.appendChild(
+      ),
       this.buildToggle('Live Wire (Breaking News)', this.settings.widgets.newsWidget, () =>
         void this.update((s) => {
           s.widgets.newsWidget = !s.widgets.newsWidget;
         })
       )
-    );
+    ];
 
-    const rackGroup = el('div', 'form-group');
-    rackGroup.appendChild(el('label', undefined, 'Workspace Deck modules'));
+    const rackToggles: HTMLElement[] = [];
     for (const def of registry.getAll()) {
       const enabled = await isWidgetEnabled(def.id);
-      rackGroup.appendChild(
+      rackToggles.push(
         this.buildToggle(def.title, enabled, async () => {
           await setWidgetEnabled(def.id, !enabled);
           await this.callbacks.onModulesChange?.();
@@ -804,32 +1103,20 @@ export class SettingsUI {
       );
     }
 
-    const assetsGroup = el('div', 'form-group');
-    assetsGroup.appendChild(el('label', undefined, t('financeAssets')));
-    const assetRow = el('div', 'seg-row');
-    for (const assetId of Object.keys(FINANCE_ASSETS) as FinanceAssetId[]) {
-      const active = this.settings.finance.assets.includes(assetId);
-      const btn = el('button', 'seg-btn' + (active ? ' active' : ''), FINANCE_ASSETS[assetId].name);
-      btn.type = 'button';
-      btn.addEventListener('click', () =>
-        void this.update((s) => {
-          const exists = s.finance.assets.includes(assetId);
-          if (exists && s.finance.assets.length > 1) {
-            s.finance.assets = s.finance.assets.filter((id) => id !== assetId);
-          } else if (!exists) {
-            s.finance.assets = [...s.finance.assets, assetId];
-          }
-        })
-      );
-      assetRow.appendChild(btn);
-    }
-    assetsGroup.appendChild(assetRow);
-
-    this.contentArea.append(rightPaneGroup, rackGroup, assetsGroup);
+    this.contentArea.append(
+      header,
+      this.buildSubSection('Right Pane Telemetry', ...rightToggles),
+      this.buildSubSection('Workspace Deck Modules', ...rackToggles)
+    );
   }
 
-  // --- Tab 5: Privacy, Backup & Reset ---
+  // --- System: Privacy ---
   private renderPrivacy(): void {
+    const header = this.buildPanelHeader(
+      'Privacy',
+      'Control which local browser sources appear in command bar search.'
+    );
+
     const histToggle = this.buildToggle(t('historySearch'), this.settings.privacy.historySearch, () =>
       void this.update((s) => {
         s.privacy.historySearch = !s.privacy.historySearch;
@@ -842,22 +1129,32 @@ export class SettingsUI {
       })
     );
 
-    this.contentArea.append(histToggle, clipToggle);
+    const items: HTMLElement[] = [histToggle, clipToggle];
 
     if (this.settings.privacy.clipboardHistory) {
-      this.contentArea.appendChild(el('div', 'settings-note', t('clipboardNote')));
+      items.push(el('div', 'settings-note', t('clipboardNote')));
       const clearClipBtn = el('button', 'hw-btn', 'Clear captured clipboard');
       clearClipBtn.type = 'button';
       clearClipBtn.addEventListener('click', async () => {
         await clearClipboardHistory();
         this.callbacks.onToast?.('Clipboard history cleared');
       });
-      this.contentArea.appendChild(clearClipBtn);
+      const btnWrap = el('div', 'seg-row');
+      btnWrap.appendChild(clearClipBtn);
+      items.push(btnWrap);
     }
 
-    // Backup & Restore
+    this.contentArea.append(header, this.buildSubSection('Local Search Sources', ...items));
+  }
+
+  // --- System: Backup & Reset ---
+  private renderBackup(): void {
+    const header = this.buildPanelHeader(
+      'Backup & Reset',
+      'Export or restore your full configuration, or reset back to defaults.'
+    );
+
     const backupGroup = el('div', 'form-group');
-    backupGroup.appendChild(el('label', undefined, 'Configuration backup'));
     const backupRow = el('div', 'seg-row');
 
     const exportBtn = el('button', 'hw-btn', 'Export JSON');
@@ -917,17 +1214,22 @@ export class SettingsUI {
     backupRow.append(exportBtn, importBtn, resetAllBtn);
     backupGroup.appendChild(backupRow);
 
-    // About & Version
     const manifest = chrome.runtime.getManifest();
     const aboutGroup = el('div', 'form-group');
     aboutGroup.appendChild(el('label', undefined, `${t('versionLabel')} ${manifest.version}`));
     aboutGroup.appendChild(el('div', 'settings-note', t('dataSources')));
 
+    const reloadWrap = el('div', 'seg-row');
     const reloadBtn = el('button', 'hw-btn', t('reloadExtension'));
     reloadBtn.type = 'button';
     reloadBtn.addEventListener('click', () => chrome.runtime.reload());
+    reloadWrap.appendChild(reloadBtn);
 
-    this.contentArea.append(backupGroup, aboutGroup, reloadBtn);
+    this.contentArea.append(
+      header,
+      this.buildSubSection('Configuration Data', backupGroup),
+      this.buildSubSection('Extension Info', aboutGroup, reloadWrap)
+    );
   }
 
   static async init(callbacks: SettingsUICallbacks): Promise<SettingsUI> {

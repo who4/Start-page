@@ -1,4 +1,4 @@
-import type { FinanceAssetId } from './constants';
+import type { FinanceAssetId, MarketProviderId, SearchEngineId } from './constants';
 
 export type CalendarType = 'gregorian' | 'jalali';
 
@@ -69,6 +69,8 @@ export interface Settings {
     colorPalette: string[];
   };
   general: {
+    searchEngine: SearchEngineId;
+    customSearchUrl: string;
     calendar: CalendarType;
     clock24h: boolean;
     showSeconds: boolean;
@@ -94,6 +96,8 @@ export interface Settings {
     clipboardHistory: boolean;
   };
   finance: {
+    provider: MarketProviderId;
+    spotlight: FinanceAssetId;
     assets: FinanceAssetId[];
     alerts: PriceAlert[];
   };
@@ -124,6 +128,7 @@ export interface NoteData {
 export interface FetchSuggestionsRequest {
   action: 'FETCH_SUGGESTIONS';
   query: string;
+  engine?: string;
 }
 
 export interface ProxyFetchRequest {

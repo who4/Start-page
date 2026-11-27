@@ -1,18 +1,46 @@
-// Market Pulse module — live USD/Gold/EUR prices, interactive HiDPI sparklines, threshold alerts.
+// Market Pulse module — live USDT/USD/Gold/EUR/BTC/ETH prices, interactive HiDPI sparklines, threshold alerts.
 import { ApiClient, type PriceData } from './api';
-import { FINANCE_ASSETS, PRICE_HISTORY_KEY, PRICE_HISTORY_MAX, type FinanceAssetId } from './constants';
+import {
+  FINANCE_ASSETS,
+  PRICE_HISTORY_KEY,
+  PRICE_HISTORY_MAX,
+  type AssetUnit,
+  type FinanceAssetId,
+  type MarketProviderId
+} from './constants';
 import { storage } from './storage';
 import type { PriceAlert, Settings } from './types';
 import type { WidgetDef } from './grid';
 
 export interface PriceHistoryPoint {
   t: number; // timestamp ms
-  p: number; // price in Rial
+  p: number; // Rial for Toman assets (legacy compatible), USD for crypto spot assets
   trend: 'up' | 'down' | 'flat';
 }
 
 interface PriceHistoryStore {
   [assetId: string]: PriceHistoryPoint[];
+}
+
+const PROVIDER_LABELS: Record<MarketProviderId, string> = {
+  auto: 'AlanChand + Nobitex · Live',
+  alanchand: 'AlanChand · Live',
+  wallex: 'Wallex + AlanChand · Live',
+  tgju: 'TGJU · Live'
+};
+
+function formatAssetValue(value: number, unit: AssetUnit): string {
+  if (!Number.isFinite(value)) return '---';
+  if (unit === 'usd') {
+    return `$${value.toLocaleString('en-US', {
+      maximumFractionDigits: value >= 1000 ? 0 : 2
+    })}`;
+  }
+  return Math.round(value).toLocaleString('en-US');
+}
+
+function unitSuffix(unit: AssetUnit): string {
+  return unit === 'usd' ? 'USD' : 'Toman';
 }
 
 export async function appendPricePoint(
@@ -48,6 +76,7 @@ function drawInteractiveSparkline(
   canvas: HTMLCanvasElement,
   history: PriceHistoryPoint[],
   trend: PriceData['trend'],
+  unit: AssetUnit,
   hoverIndex: number | null
 ): void {
   const ctx = canvas.getContext('2d');
@@ -93,12 +122,12 @@ function drawInteractiveSparkline(
     ctx.fill();
 
     ctx.fillStyle = textMuted;
-    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.font = '10px "Geist Mono", monospace';
     ctx.fillText(history.length === 1 ? '1st reading logged' : 'Awaiting live feed', 4, h - 4);
     return;
   }
 
-  const points = history.map((pt) => pt.p / 10);
+  const points = history.map((pt) => (unit === 'toman' ? pt.p / 10 : pt.p));
   const min = Math.min(...points);
   const max = Math.max(...points);
   const range = max - min || 1;
@@ -185,7 +214,12 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
     async render(container) {
       container.replaceChildren();
       const settings = deps.getSettings();
-      const assetIds = settings.finance.assets.length > 0 ? settings.finance.assets : (['usd', 'gold'] as FinanceAssetId[]);
+      const provider: MarketProviderId = settings.finance.provider ?? 'auto';
+      const validAssets = (settings.finance.assets || []).filter(
+        (id): id is FinanceAssetId => id in FINANCE_ASSETS
+      );
+      const assetIds: FinanceAssetId[] =
+        validAssets.length > 0 ? validAssets : ['usdt', 'usd', 'gold', 'btc'];
       const alerts = settings.finance.alerts || [];
 
       // Header
@@ -199,7 +233,7 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
       title.textContent = 'Market Pulse';
       const meta = document.createElement('span');
       meta.className = 'mod-meta';
-      meta.textContent = 'Toman · Live';
+      meta.textContent = PROVIDER_LABELS[provider] ?? 'Live';
       titleWrap.append(title, meta);
 
       const controls = document.createElement('div');
@@ -234,8 +268,6 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
       grid.className = 'market-grid';
       container.appendChild(grid);
 
-      const liveTomans = new Map<FinanceAssetId, number>();
-
       for (const assetId of assetIds) {
         const def = FINANCE_ASSETS[assetId];
         if (!def) continue;
@@ -246,15 +278,15 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
         const top = document.createElement('div');
         top.className = 'market-card-top';
 
-        const label = document.createElement('span');
-        label.className = 'market-code';
-        label.textContent = `${def.code} · ${def.name}`;
+        const labelWrap = document.createElement('span');
+        labelWrap.className = 'market-code';
+        labelWrap.textContent = `${def.code} · ${def.name}`;
 
         const trendEl = document.createElement('span');
         trendEl.className = 'market-trend';
         trendEl.textContent = '—';
 
-        top.append(label, trendEl);
+        top.append(labelWrap, trendEl);
 
         const valRow = document.createElement('div');
         valRow.className = 'market-value-row';
@@ -263,10 +295,10 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
         priceEl.className = 'market-price';
         priceEl.textContent = 'Loading...';
 
-        const inspectEl = document.createElement('span');
-        inspectEl.className = 'market-inspect';
+        const rightInfo = document.createElement('span');
+        rightInfo.className = 'market-inspect';
 
-        valRow.append(priceEl, inspectEl);
+        valRow.append(priceEl, rightInfo);
 
         const canvas = document.createElement('canvas');
         canvas.className = 'market-sparkline';
@@ -279,7 +311,7 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
         row.append(top, valRow, canvas, alertStatusEl);
         grid.appendChild(row);
 
-        void hydrateAsset(assetId, alerts, priceEl, trendEl, inspectEl, canvas, alertStatusEl, liveTomans);
+        void hydrateAsset(assetId, provider, alerts, priceEl, trendEl, rightInfo, canvas, alertStatusEl);
       }
 
       // Collapsible Alerts Drawer inside module
@@ -307,8 +339,14 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
         valInput.type = 'number';
         valInput.min = '1';
         valInput.step = 'any';
-        valInput.placeholder = 'Toman target';
         valInput.className = 'hw-input-sm';
+
+        const syncAlertPlaceholder = (): void => {
+          const chosen = FINANCE_ASSETS[assetSel.value as FinanceAssetId];
+          valInput.placeholder = `${unitSuffix(chosen?.unit ?? 'toman')} target`;
+        };
+        syncAlertPlaceholder();
+        assetSel.addEventListener('change', syncAlertPlaceholder);
 
         const addBtn = document.createElement('button');
         addBtn.type = 'submit';
@@ -344,8 +382,13 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
             item.className = 'market-alert-row';
             const desc = document.createElement('span');
             desc.className = 'market-alert-desc';
-            const cond = al.above !== undefined ? `≥ ${al.above.toLocaleString('en-US')}` : `≤ ${(al.below ?? 0).toLocaleString('en-US')}`;
-            desc.textContent = `${FINANCE_ASSETS[al.asset]?.code ?? al.asset.toUpperCase()} ${cond} Toman`;
+            const def = FINANCE_ASSETS[al.asset];
+            const uLabel = unitSuffix(def?.unit ?? 'toman');
+            const cond =
+              al.above !== undefined
+                ? `≥ ${al.above.toLocaleString('en-US')}`
+                : `≤ ${(al.below ?? 0).toLocaleString('en-US')}`;
+            desc.textContent = `${def?.code ?? al.asset.toUpperCase()} ${cond} ${uLabel}`;
 
             const toggle = document.createElement('button');
             toggle.type = 'button';
@@ -382,38 +425,48 @@ export function createFinanceWidget(deps: FinanceWidgetDeps): WidgetDef {
 
 async function hydrateAsset(
   assetId: FinanceAssetId,
+  provider: MarketProviderId,
   alerts: PriceAlert[],
   priceEl: HTMLElement,
   trendEl: HTMLElement,
   inspectEl: HTMLElement,
   canvas: HTMLCanvasElement,
-  alertStatusEl: HTMLElement,
-  liveTomans: Map<FinanceAssetId, number>
+  alertStatusEl: HTMLElement
 ): Promise<void> {
-  const data = await ApiClient.fetchAssetPrice(assetId);
+  const def = FINANCE_ASSETS[assetId];
+  const data = await ApiClient.fetchAssetPrice(assetId, provider);
   let history = await getHistory(assetId);
 
   if (data.price === 'Error') {
     priceEl.textContent = 'Unavailable';
     trendEl.textContent = 'Offline';
     trendEl.className = 'market-trend';
-    drawInteractiveSparkline(canvas, history.slice(-48), 'flat', null);
+    drawInteractiveSparkline(canvas, history.slice(-48), 'flat', def.unit, null);
     return;
   }
 
-  const rialNum = parseInt(data.price.replace(/,/g, ''), 10);
-  const toman = Number.isFinite(rialNum) ? rialNum / 10 : NaN;
-  if (Number.isFinite(rialNum) && rialNum > 0) {
-    history = await appendPricePoint(assetId, rialNum, data.trend);
-    liveTomans.set(assetId, toman);
+  const parsedRaw = parseFloat(data.price.replace(/,/g, ''));
+  const displayVal =
+    data.numericValue ?? (def.unit === 'toman' ? (Number.isFinite(parsedRaw) ? Math.round(parsedRaw / 10) : NaN) : parsedRaw);
+  const historyVal = def.unit === 'toman' ? (Number.isFinite(parsedRaw) ? Math.round(parsedRaw) : Math.round(displayVal * 10)) : displayVal;
+
+  if (Number.isFinite(historyVal) && historyVal > 0) {
+    history = await appendPricePoint(assetId, historyVal, data.trend);
   }
 
-  priceEl.textContent = Number.isFinite(toman) ? toman.toLocaleString('en-US') : data.price;
+  priceEl.textContent = Number.isFinite(displayVal) ? formatAssetValue(displayVal, def.unit) : data.price;
 
-  // Calculate session delta if history has >= 2 points
+  const sourceCaption = data.source ? `${data.source} · ${unitSuffix(def.unit)}` : unitSuffix(def.unit);
+  inspectEl.textContent = sourceCaption;
+  inspectEl.className = 'market-source';
+
+  // Prefer live 24h % delta from exchange/TGJU; fallback to local session history delta
   const slice = history.slice(-48);
   let deltaText = '';
-  if (slice.length >= 2) {
+  if (data.changePercent !== undefined && Number.isFinite(data.changePercent) && Math.abs(data.changePercent) >= 0.01) {
+    const sign = data.changePercent > 0 ? '+' : '';
+    deltaText = ` ${sign}${data.changePercent.toFixed(2)}%`;
+  } else if (slice.length >= 2) {
     const first = slice[0].p;
     const latest = slice[slice.length - 1].p;
     if (first > 0) {
@@ -425,29 +478,33 @@ async function hydrateAsset(
   }
 
   trendEl.textContent =
-    data.trend === 'up' ? `▲ Up${deltaText}` : data.trend === 'down' ? `▼ Down${deltaText}` : `— Flat${deltaText}`;
+    data.trend === 'up'
+      ? `▲${deltaText || ' Up'}`
+      : data.trend === 'down'
+      ? `▼${deltaText || ' Down'}`
+      : `—${deltaText || ' Flat'}`;
   trendEl.className =
     'market-trend ' + (data.trend === 'up' ? 'is-up' : data.trend === 'down' ? 'is-down' : 'is-flat');
 
   // Check active threshold alerts
-  if (Number.isFinite(toman)) {
+  if (Number.isFinite(displayVal)) {
     const triggered = alerts.find(
       (a) =>
         a.enabled &&
         a.asset === assetId &&
-        ((a.above !== undefined && toman >= a.above) || (a.below !== undefined && toman <= a.below))
+        ((a.above !== undefined && displayVal >= a.above) || (a.below !== undefined && displayVal <= a.below))
     );
     if (triggered) {
       alertStatusEl.hidden = false;
       alertStatusEl.textContent =
-        triggered.above !== undefined && toman >= triggered.above
-          ? `ALERT · Reached ≥ ${triggered.above.toLocaleString('en-US')}`
-          : `ALERT · Reached ≤ ${(triggered.below ?? 0).toLocaleString('en-US')}`;
+        triggered.above !== undefined && displayVal >= triggered.above
+          ? `ALERT · Reached ≥ ${formatAssetValue(triggered.above, def.unit)}`
+          : `ALERT · Reached ≤ ${formatAssetValue(triggered.below ?? 0, def.unit)}`;
     }
   }
 
   requestAnimationFrame(() => {
-    drawInteractiveSparkline(canvas, slice, data.trend, null);
+    drawInteractiveSparkline(canvas, slice, data.trend, def.unit, null);
   });
 
   // Pointer hover inspection
@@ -458,13 +515,16 @@ async function hydrateAsset(
       const idx = Math.round(rel * (slice.length - 1));
       const pt = slice[idx];
       if (!pt) return;
+      const ptVal = def.unit === 'toman' ? pt.p / 10 : pt.p;
       const timeStr = new Date(pt.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      inspectEl.textContent = `${(pt.p / 10).toLocaleString('en-US')} · ${timeStr}`;
-      drawInteractiveSparkline(canvas, slice, data.trend, idx);
+      inspectEl.className = 'market-inspect';
+      inspectEl.textContent = `${formatAssetValue(ptVal, def.unit)} · ${timeStr}`;
+      drawInteractiveSparkline(canvas, slice, data.trend, def.unit, idx);
     });
     canvas.addEventListener('pointerleave', () => {
-      inspectEl.textContent = '';
-      drawInteractiveSparkline(canvas, slice, data.trend, null);
+      inspectEl.className = 'market-source';
+      inspectEl.textContent = sourceCaption;
+      drawInteractiveSparkline(canvas, slice, data.trend, def.unit, null);
     });
   }
 }

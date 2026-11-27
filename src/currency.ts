@@ -12,6 +12,8 @@ type AssetKey = 'usd' | 'gold';
 
 const ALIASES: Record<string, AssetKey> = {
   usd: 'usd',
+  usdt: 'usd',
+  tether: 'usd',
   dollar: 'usd',
   dollars: 'usd',
   $: 'usd',
@@ -19,7 +21,8 @@ const ALIASES: Record<string, AssetKey> = {
   geram: 'gold',
   gram18: 'gold',
   طلا: 'gold',
-  دلار: 'usd'
+  دلار: 'usd',
+  تتر: 'usd'
 };
 
 // Words that mean "the target is Toman" — the only target currency for now

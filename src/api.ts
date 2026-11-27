@@ -4,12 +4,15 @@ import {
   getNewsSource,
   hostOfUrl,
   INTERVALS,
-  type FinanceAssetId
+  type AssetUnit,
+  type FinanceAssetId,
+  type MarketProviderId
 } from './constants';
 import type { NewsSettings } from './types';
 
-// All price sources normalized to Rial internally; Toman conversion happens
-// once at render time (script.ts).
+// Toman assets carry Rial-formatted `price` (for backwards compatibility with
+// existing history/currency conversion) plus normalized `numericValue` (in Toman
+// for Toman assets, or USD for crypto spot assets).
 
 const PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
 const ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩';
@@ -25,10 +28,11 @@ function normalizeDigits(text: string): string {
   });
 }
 
-function toRialNumber(raw: unknown): number | null {
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+function toPositiveNumber(raw: unknown): number | null {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
   if (typeof raw === 'string') {
-    const n = parseInt(normalizeDigits(raw).replace(/[^\d]/g, ''), 10);
+    const cleaned = normalizeDigits(raw).replace(/,/g, '').replace(/[^\d.]/g, '');
+    const n = parseFloat(cleaned);
     if (Number.isFinite(n) && n > 0) return n;
   }
   return null;
@@ -36,7 +40,11 @@ function toRialNumber(raw: unknown): number | null {
 
 export interface PriceData {
   price: string;
+  numericValue?: number;
+  unit: AssetUnit;
   trend: 'up' | 'down' | 'flat';
+  changePercent?: number;
+  source?: string;
 }
 
 export interface RssFeedItem {
@@ -55,20 +63,34 @@ export interface NewsArticle {
   noKeywordMatch?: boolean;
 }
 
-interface BrsApiItem {
-  name?: string;
-  price?: string | number;
-}
-
-interface BrsApiResponse {
-  currency?: BrsApiItem[];
-}
-
 // api.tgju.org summary-table-data?length=1 → newest daily OHLC row.
-// Columns: [open, low, high, close, changeAmountHtml, changePercentHtml, gregorianDate, jalaliDate]
 type TgjuRow = [string, string, string, string, string, string, string, string];
 interface TgjuSummaryResponse {
   data?: TgjuRow[];
+}
+
+interface TgjuAjaxItem {
+  p?: string;
+  dp?: number | string;
+  dt?: string;
+}
+
+interface NobitexStat {
+  latest?: string;
+  dayChange?: string;
+}
+
+interface WallexSymbol {
+  stats?: {
+    lastPrice?: string;
+    '24h_ch'?: number | string;
+  };
+}
+
+interface BinanceTicker {
+  symbol?: string;
+  lastPrice?: string;
+  priceChangePercent?: string;
 }
 
 interface CachedPrice {
@@ -215,7 +237,7 @@ function findMatchingKeyword(item: RssFeedItem, keywords: string[]): string | nu
   return null;
 }
 
-const PRICE_CACHE_STORAGE_KEY = 'priceCacheV2';
+const PRICE_CACHE_STORAGE_KEY = 'priceCacheV3';
 const NEWS_CACHE_STORAGE_KEY = 'newsCacheV2';
 const NEWS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
 
@@ -236,14 +258,29 @@ function newsCacheKey(newsSettings?: NewsSettings): string {
   return `${sourceId}|${customUrl}|${keywords}`;
 }
 
+function trendFromPercent(pct: number | undefined): PriceData['trend'] {
+  if (pct === undefined || !Number.isFinite(pct)) return 'flat';
+  if (pct > 0.05) return 'up';
+  if (pct < -0.05) return 'down';
+  return 'flat';
+}
+
 export class ApiClient {
   private static suggestController: AbortController | null = null;
+  private static suggestionCache: Map<string, { items: string[]; ts: number }> = new Map();
 
-  // In-memory + persistent chrome.storage.local cache
-  private static priceCache: Map<FinanceAssetId, CachedPrice> = new Map();
+  // In-memory + persistent chrome.storage.local cache keyed by `${provider}:${asset}`
+  private static priceCache: Map<string, CachedPrice> = new Map();
   private static priceCacheHydrated = false;
-  private static inflightPrice: Map<FinanceAssetId, Promise<PriceData>> = new Map();
+  private static inflightPrice: Map<string, Promise<PriceData>> = new Map();
   private static inflightNews: Map<string, Promise<NewsArticle | null>> = new Map();
+
+  // Short-lived shared batch promises so multi-asset fetches share 1 HTTP request per exchange/source
+  private static alanchandBatchPromise: Promise<Partial<Record<FinanceAssetId, PriceData>>> | null = null;
+  private static nobitexBatchPromise: Promise<Partial<Record<FinanceAssetId, PriceData>>> | null = null;
+  private static wallexBatchPromise: Promise<Partial<Record<FinanceAssetId, PriceData>>> | null = null;
+  private static binanceBatchPromise: Promise<Partial<Record<FinanceAssetId, PriceData>>> | null = null;
+  private static tgjuAjaxPromise: Promise<Record<string, TgjuAjaxItem>> | null = null;
 
   static clearPriceCache(): void {
     this.priceCache.clear();
@@ -266,7 +303,7 @@ export class ApiClient {
       if (stored && typeof stored === 'object') {
         for (const [k, v] of Object.entries(stored)) {
           if (v && v.value && typeof v.timestamp === 'number') {
-            this.priceCache.set(k as FinanceAssetId, v);
+            this.priceCache.set(k, v);
           }
         }
       }
@@ -288,14 +325,15 @@ export class ApiClient {
   }
 
   static async getCachedPrices(
-    assetIds: FinanceAssetId[] = ['usd', 'gold']
+    assetIds: FinanceAssetId[] = ['usdt', 'usd', 'gold', 'btc'],
+    provider: MarketProviderId = 'auto'
   ): Promise<{ data: Partial<Record<FinanceAssetId, PriceData>>; fresh: boolean }> {
     await this.hydratePriceCache();
     const data: Partial<Record<FinanceAssetId, PriceData>> = {};
     let fresh = true;
     const now = Date.now();
     for (const id of assetIds) {
-      const entry = this.priceCache.get(id);
+      const entry = this.priceCache.get(`${provider}:${id}`);
       if (entry) {
         data[id] = entry.value;
         if (now - entry.timestamp >= INTERVALS.priceCache) fresh = false;
@@ -555,49 +593,119 @@ export class ApiClient {
     return null;
   }
 
-  // --- Suggestions ---
+  // --- Suggestions (LRU-cached, AbortController-backed, engine-aware) ---
 
-  static async fetchSuggestions(query: string): Promise<string[]> {
-    if (!query) return [];
+  private static suggestCacheKey(query: string, engine: string): string {
+    const kind =
+      engine === 'duckduckgo' || engine === 'brave' || engine === 'startpage' || engine === 'kagi'
+        ? 'ddg'
+        : 'google';
+    return `${kind}:${query.trim().toLowerCase()}`;
+  }
 
-    // Abort the previous in-flight request; one BG roundtrip per settled query.
+  static getCachedSuggestions(query: string, engine = 'google'): string[] | null {
+    const key = this.suggestCacheKey(query, engine);
+    const entry = this.suggestionCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > 5 * 60 * 1000) {
+      this.suggestionCache.delete(key);
+      return null;
+    }
+    return entry.items;
+  }
+
+  static abortSuggestions(): void {
+    this.suggestController?.abort();
+    this.suggestController = null;
+  }
+
+  static async fetchSuggestions(query: string, engine = 'google'): Promise<string[]> {
+    const trimmed = query.trim();
+    if (!trimmed) return [];
+
+    const cached = this.getCachedSuggestions(trimmed, engine);
+    if (cached) return cached;
+
     this.suggestController?.abort();
     const controller = new AbortController();
     this.suggestController = controller;
 
-    return new Promise((resolve) => {
+    const saveToCache = (items: string[]): string[] => {
+      if (items.length > 0) {
+        const key = this.suggestCacheKey(trimmed, engine);
+        this.suggestionCache.set(key, { items, ts: Date.now() });
+        if (this.suggestionCache.size > 80) {
+          const oldest = this.suggestionCache.keys().next().value;
+          if (oldest !== undefined) this.suggestionCache.delete(oldest);
+        }
+      }
+      return items;
+    };
+
+    const isExtension =
+      typeof chrome !== 'undefined' &&
+      typeof chrome.runtime?.id === 'string' &&
+      chrome.runtime.id.length > 0;
+
+    if (!isExtension) {
       try {
-        chrome.runtime.sendMessage({ action: 'FETCH_SUGGESTIONS', query }, (response) => {
-          if (controller.signal.aborted) return;
-          if (chrome.runtime.lastError) {
-            resolve([]);
-            return;
-          }
-          if (response && response.success) {
-            resolve(response.data as string[]);
-          } else {
-            resolve([]);
-          }
-        });
+        const resp = await fetch(
+          `/api/suggestions?q=${encodeURIComponent(trimmed)}&engine=${encodeURIComponent(engine)}`,
+          { signal: controller.signal }
+        );
+        if (!resp.ok || controller.signal.aborted) return [];
+        const data = (await resp.json()) as string[];
+        return Array.isArray(data) ? saveToCache(data) : [];
       } catch {
+        return [];
+      }
+    }
+
+    return new Promise((resolve) => {
+      const onAbort = (): void => resolve([]);
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        chrome.runtime.sendMessage(
+          { action: 'FETCH_SUGGESTIONS', query: trimmed, engine },
+          (response) => {
+            controller.signal.removeEventListener('abort', onAbort);
+            if (controller.signal.aborted) return;
+            if (chrome.runtime.lastError) {
+              resolve([]);
+              return;
+            }
+            if (response && response.success && Array.isArray(response.data)) {
+              resolve(saveToCache(response.data as string[]));
+            } else {
+              resolve([]);
+            }
+          }
+        );
+      } catch {
+        controller.signal.removeEventListener('abort', onAbort);
         resolve([]);
       }
     });
   }
 
-  // --- Prices ---
+  // --- Prices (Verified Multi-Provider Engine) ---
   //
-  // Source chain per asset:
-  //   1. cache (< INTERVALS.priceCache old)
-  //   2. TGJU JSON API (~400 bytes, includes change direction)
-  //   3. TGJU profile page scrape (heavy fallback)
-  //   4. brsapi free endpoint
+  // Live zero-key providers:
+  //   • AlanChand (~80ms single batch):   Live Tehran USD, Gold 18K, EUR, USDT, BTC, ETH + 24h %
+  //   • Nobitex v2 (1.4 KB single batch): USDT/IRT (24/7), BTC/USD, ETH/USD + 24h %
+  //   • Wallex v1 (400ms batch backup):   USDT/TMN (24/7), BTC/USD, ETH/USD + 24h %
+  //   • TGJU compact JSON (~200B each):   USD (bazaar), Gold 18K, EUR + TGJU live ajax backup
+  //   • Binance public ticker (1.6 KB):   Global BTC/USD & ETH/USD backup
 
   static async fetchPrices(
-    assetIds?: FinanceAssetId[]
+    assetIds?: FinanceAssetId[],
+    provider: MarketProviderId = 'auto'
   ): Promise<Record<FinanceAssetId, PriceData>> {
-    const ids = assetIds && assetIds.length > 0 ? assetIds : (Object.keys(FINANCE_ASSETS) as FinanceAssetId[]);
-    const results = await Promise.all(ids.map((id) => this.fetchAssetPrice(id)));
+    const ids =
+      assetIds && assetIds.length > 0
+        ? assetIds
+        : (Object.keys(FINANCE_ASSETS) as FinanceAssetId[]);
+    const results = await Promise.all(ids.map((id) => this.fetchAssetPrice(id, provider)));
     const out = {} as Record<FinanceAssetId, PriceData>;
     ids.forEach((id, i) => {
       out[id] = results[i];
@@ -605,121 +713,477 @@ export class ApiClient {
     return out;
   }
 
-  static async fetchAssetPrice(asset: FinanceAssetId): Promise<PriceData> {
+  static async fetchAssetPrice(
+    asset: FinanceAssetId,
+    provider: MarketProviderId = 'auto'
+  ): Promise<PriceData> {
     await this.hydratePriceCache();
-    const cached = this.priceCache.get(asset);
+    const cacheKey = `${provider}:${asset}`;
+    const cached = this.priceCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < INTERVALS.priceCache) {
       return cached.value;
     }
 
-    const pending = this.inflightPrice.get(asset);
+    const pending = this.inflightPrice.get(cacheKey);
     if (pending) return pending;
 
     const task = (async (): Promise<PriceData> => {
-      const jsonResult = await this.fetchTgjuJson(asset).catch(() => null);
-      let result: PriceData = jsonResult ?? { price: 'Error', trend: 'flat' };
+      const def = FINANCE_ASSETS[asset];
+      let result: PriceData | null = null;
 
-      if (result.price === 'Error' && (asset === 'usd' || asset === 'gold')) {
-        result = await this.fetchProfileData(
-          asset === 'usd' ? API_URLS.dollarProfile : API_URLS.goldProfile
-        );
-      }
-      if (result.price === 'Error') {
-        result = await this.fetchBrsAsset(asset);
+      if (provider === 'alanchand') {
+        result = (await this.fetchAlanChandBatch())[asset] ?? null;
+        if (!result) {
+          if (asset === 'usdt') {
+            result = (await this.fetchNobitexBatch()).usdt ?? (await this.fetchWallexBatch()).usdt ?? null;
+          } else if (asset === 'btc' || asset === 'eth') {
+            result = (await this.fetchNobitexBatch())[asset] ?? (await this.fetchBinanceBatch())[asset] ?? null;
+          } else {
+            result = (await this.fetchTgjuJson(asset).catch(() => null)) ?? (await this.fetchTgjuAjaxAsset(asset)) ?? null;
+          }
+        }
+      } else if (asset === 'usdt') {
+        if (provider === 'wallex') {
+          result =
+            (await this.fetchWallexBatch())[asset] ??
+            (await this.fetchNobitexBatch())[asset] ??
+            (await this.fetchAlanChandBatch())[asset] ??
+            null;
+        } else {
+          result =
+            (await this.fetchNobitexBatch())[asset] ??
+            (await this.fetchWallexBatch())[asset] ??
+            (await this.fetchAlanChandBatch())[asset] ??
+            null;
+        }
+        if (!result) {
+          result = await this.fetchTgjuJson('usd').catch(() => null);
+        }
+      } else if (asset === 'btc' || asset === 'eth') {
+        if (provider === 'tgju') {
+          result =
+            (await this.fetchTgjuAjaxAsset(asset)) ??
+            (await this.fetchAlanChandBatch())[asset] ??
+            (await this.fetchNobitexBatch())[asset] ??
+            (await this.fetchBinanceBatch())[asset] ??
+            null;
+        } else if (provider === 'wallex') {
+          result =
+            (await this.fetchWallexBatch())[asset] ??
+            (await this.fetchNobitexBatch())[asset] ??
+            (await this.fetchBinanceBatch())[asset] ??
+            null;
+        } else {
+          result =
+            (await this.fetchNobitexBatch())[asset] ??
+            (await this.fetchWallexBatch())[asset] ??
+            (await this.fetchBinanceBatch())[asset] ??
+            (await this.fetchAlanChandBatch())[asset] ??
+            (await this.fetchTgjuAjaxAsset(asset)) ??
+            null;
+        }
+      } else {
+        // Tehran free-market fiat & 18K gold: usd, gold, eur
+        if (provider === 'tgju') {
+          result =
+            (await this.fetchTgjuJson(asset).catch(() => null)) ??
+            (await this.fetchTgjuAjaxAsset(asset)) ??
+            (await this.fetchAlanChandBatch())[asset] ??
+            null;
+        } else {
+          // 'auto' and 'wallex' prefer AlanChand's single 80ms Tehran free-market batch, falling back to TGJU
+          result =
+            (await this.fetchAlanChandBatch())[asset] ??
+            (await this.fetchTgjuJson(asset).catch(() => null)) ??
+            (await this.fetchTgjuAjaxAsset(asset)) ??
+            null;
+        }
+        if (!result && asset === 'usd') {
+          result =
+            (await this.fetchNobitexBatch()).usdt ??
+            (await this.fetchWallexBatch()).usdt ??
+            null;
+        }
       }
 
-      if (result.price !== 'Error') {
-        this.priceCache.set(asset, { value: result, timestamp: Date.now() });
+      const finalResult: PriceData = result ?? {
+        price: 'Error',
+        unit: def.unit,
+        trend: 'flat'
+      };
+
+      if (finalResult.price !== 'Error') {
+        this.priceCache.set(cacheKey, { value: finalResult, timestamp: Date.now() });
         this.persistPriceCache();
       }
-      return result;
+      return finalResult;
     })();
 
-    this.inflightPrice.set(asset, task);
+    this.inflightPrice.set(cacheKey, task);
     try {
       return await task;
     } finally {
-      this.inflightPrice.delete(asset);
+      this.inflightPrice.delete(cacheKey);
     }
   }
 
-  private static async fetchTgjuJson(asset: FinanceAssetId): Promise<PriceData> {
-    const symbol = FINANCE_ASSETS[asset].tgju;
-    const url = `https://api.tgju.org/v1/market/indicator/summary-table-data/${symbol}?length=1`;
+  private static fetchAlanChandBatch(): Promise<Partial<Record<FinanceAssetId, PriceData>>> {
+    if (this.alanchandBatchPromise) return this.alanchandBatchPromise;
+    const p = (async (): Promise<Partial<Record<FinanceAssetId, PriceData>>> => {
+      const out: Partial<Record<FinanceAssetId, PriceData>> = {};
+      try {
+        const html = await this.fetchViaBackground(API_URLS.alanchand);
+        const entries: ReadonlyArray<readonly [FinanceAssetId, string]> = [
+          ['usd', 'c.usd'],
+          ['eur', 'c.eur'],
+          ['gold', 'g.18ayar'],
+          ['usdt', 'x.usdt'],
+          ['btc', 'xu.btc'],
+          ['eth', 'xu.eth']
+        ];
+
+        for (const [assetId, liveKey] of entries) {
+          const escaped = liveKey.replace('.', '\\.');
+          const re = new RegExp(`<span\\b([^>]*data-live="${escaped}"[^>]*)>([^<]+)<\\/span>([\\s\\S]{0,220})`, 'g');
+          let match: RegExpExecArray | null;
+          let chosen: { attrs: string; rawVal: number; tail: string } | null = null;
+
+          while ((match = re.exec(html)) !== null) {
+            const val = toPositiveNumber(match[2]);
+            if (val === null) continue;
+            const hasPct = /\([^)%٪]+[%٪]\)/.test(match[3]);
+            if (!chosen || hasPct) {
+              chosen = { attrs: match[1], rawVal: val, tail: match[3] };
+              if (hasPct) break;
+            }
+          }
+
+          if (!chosen) continue;
+          const def = FINANCE_ASSETS[assetId];
+          const context = `${chosen.attrs} ${chosen.tail}`;
+          let trend: PriceData['trend'] = 'flat';
+          if (/\bv4-up\b|▲|i-chevron-up|i-trending-up/i.test(context)) trend = 'up';
+          else if (/\bv4-dn\b|\bv4-down\b|▼|i-chevron-down|i-trending-down/i.test(context)) trend = 'down';
+
+          const pctM = normalizeDigits(chosen.tail).match(/\(([^)%٪]+)[%٪]\)/);
+          let changePercent: number | undefined;
+          if (pctM) {
+            const mag = parseFloat(pctM[1].replace(/[^\d.]/g, ''));
+            if (Number.isFinite(mag) && mag > 0) {
+              changePercent = trend === 'down' ? -mag : mag;
+            }
+          }
+
+          if (def.unit === 'usd') {
+            out[assetId] = {
+              price: chosen.rawVal.toLocaleString('en-US', {
+                maximumFractionDigits: chosen.rawVal >= 1000 ? 0 : 2
+              }),
+              numericValue: chosen.rawVal,
+              unit: 'usd',
+              trend,
+              changePercent,
+              source: 'AlanChand'
+            };
+          } else {
+            // AlanChand displays Toman directly; store Rial string in `price` for backwards compatibility
+            const toman = Math.round(chosen.rawVal);
+            out[assetId] = {
+              price: (toman * 10).toLocaleString('en-US'),
+              numericValue: toman,
+              unit: 'toman',
+              trend,
+              changePercent,
+              source: 'AlanChand'
+            };
+          }
+        }
+      } catch {
+        // AlanChand unreachable — callers fall back to TGJU / Nobitex
+      }
+      return out;
+    })();
+
+    this.alanchandBatchPromise = p;
+    void p.finally(() => {
+      window.setTimeout(() => {
+        if (this.alanchandBatchPromise === p) this.alanchandBatchPromise = null;
+      }, 2500);
+    });
+    return p;
+  }
+
+  private static fetchNobitexBatch(): Promise<Partial<Record<FinanceAssetId, PriceData>>> {
+    if (this.nobitexBatchPromise) return this.nobitexBatchPromise;
+    const p = (async (): Promise<Partial<Record<FinanceAssetId, PriceData>>> => {
+      const out: Partial<Record<FinanceAssetId, PriceData>> = {};
+      try {
+        const text = await this.fetchViaBackground(API_URLS.nobitexStats);
+        const json = JSON.parse(text) as { status?: string; stats?: Record<string, NobitexStat> };
+        const stats = json.stats;
+        if (!stats) return out;
+
+        const usdtRls = toPositiveNumber(stats['usdt-rls']?.latest);
+        if (usdtRls !== null) {
+          const ch = parseFloat(String(stats['usdt-rls']?.dayChange ?? ''));
+          const pct = Number.isFinite(ch) ? ch : undefined;
+          out.usdt = {
+            price: Math.round(usdtRls).toLocaleString('en-US'),
+            numericValue: Math.round(usdtRls / 10),
+            unit: 'toman',
+            trend: trendFromPercent(pct),
+            changePercent: pct,
+            source: 'Nobitex'
+          };
+        }
+
+        for (const [id, key] of [
+          ['btc', 'btc-usdt'],
+          ['eth', 'eth-usdt']
+        ] as const) {
+          const val = toPositiveNumber(stats[key]?.latest);
+          if (val !== null) {
+            const ch = parseFloat(String(stats[key]?.dayChange ?? ''));
+            const pct = Number.isFinite(ch) ? ch : undefined;
+            out[id] = {
+              price: val.toLocaleString('en-US', {
+                maximumFractionDigits: val >= 1000 ? 0 : 2
+              }),
+              numericValue: val,
+              unit: 'usd',
+              trend: trendFromPercent(pct),
+              changePercent: pct,
+              source: 'Nobitex'
+            };
+          }
+        }
+      } catch {
+        // Nobitex unreachable — callers fall through to Wallex / Binance / TGJU
+      }
+      return out;
+    })();
+
+    this.nobitexBatchPromise = p;
+    void p.finally(() => {
+      window.setTimeout(() => {
+        if (this.nobitexBatchPromise === p) this.nobitexBatchPromise = null;
+      }, 2500);
+    });
+    return p;
+  }
+
+  private static fetchWallexBatch(): Promise<Partial<Record<FinanceAssetId, PriceData>>> {
+    if (this.wallexBatchPromise) return this.wallexBatchPromise;
+    const p = (async (): Promise<Partial<Record<FinanceAssetId, PriceData>>> => {
+      const out: Partial<Record<FinanceAssetId, PriceData>> = {};
+      try {
+        const text = await this.fetchViaBackground(API_URLS.wallexMarkets);
+        const json = JSON.parse(text) as {
+          result?: { symbols?: Record<string, WallexSymbol> };
+        };
+        const symbols = json.result?.symbols;
+        if (!symbols) return out;
+
+        const usdtTmn = toPositiveNumber(symbols.USDTTMN?.stats?.lastPrice);
+        if (usdtTmn !== null) {
+          const ch = parseFloat(String(symbols.USDTTMN?.stats?.['24h_ch'] ?? ''));
+          const pct = Number.isFinite(ch) ? ch : undefined;
+          const rial = Math.round(usdtTmn * 10);
+          out.usdt = {
+            price: rial.toLocaleString('en-US'),
+            numericValue: Math.round(usdtTmn),
+            unit: 'toman',
+            trend: trendFromPercent(pct),
+            changePercent: pct,
+            source: 'Wallex'
+          };
+        }
+
+        for (const [id, sym] of [
+          ['btc', 'BTCUSDT'],
+          ['eth', 'ETHUSDT']
+        ] as const) {
+          const val = toPositiveNumber(symbols[sym]?.stats?.lastPrice);
+          if (val !== null) {
+            const ch = parseFloat(String(symbols[sym]?.stats?.['24h_ch'] ?? ''));
+            const pct = Number.isFinite(ch) ? ch : undefined;
+            out[id] = {
+              price: val.toLocaleString('en-US', {
+                maximumFractionDigits: val >= 1000 ? 0 : 2
+              }),
+              numericValue: val,
+              unit: 'usd',
+              trend: trendFromPercent(pct),
+              changePercent: pct,
+              source: 'Wallex'
+            };
+          }
+        }
+      } catch {
+        // Wallex unreachable
+      }
+      return out;
+    })();
+
+    this.wallexBatchPromise = p;
+    void p.finally(() => {
+      window.setTimeout(() => {
+        if (this.wallexBatchPromise === p) this.wallexBatchPromise = null;
+      }, 2500);
+    });
+    return p;
+  }
+
+  private static fetchBinanceBatch(): Promise<Partial<Record<FinanceAssetId, PriceData>>> {
+    if (this.binanceBatchPromise) return this.binanceBatchPromise;
+    const p = (async (): Promise<Partial<Record<FinanceAssetId, PriceData>>> => {
+      const out: Partial<Record<FinanceAssetId, PriceData>> = {};
+      try {
+        const text = await this.fetchViaBackground(API_URLS.binanceTickers);
+        const rows = JSON.parse(text) as BinanceTicker[];
+        if (!Array.isArray(rows)) return out;
+        for (const row of rows) {
+          const id: FinanceAssetId | null =
+            row.symbol === 'BTCUSDT' ? 'btc' : row.symbol === 'ETHUSDT' ? 'eth' : null;
+          if (!id) continue;
+          const val = toPositiveNumber(row.lastPrice);
+          if (val === null) continue;
+          const ch = parseFloat(String(row.priceChangePercent ?? ''));
+          const pct = Number.isFinite(ch) ? ch : undefined;
+          out[id] = {
+            price: val.toLocaleString('en-US', {
+              maximumFractionDigits: val >= 1000 ? 0 : 2
+            }),
+            numericValue: val,
+            unit: 'usd',
+            trend: trendFromPercent(pct),
+            changePercent: pct,
+            source: 'Binance'
+          };
+        }
+      } catch {
+        // Binance unreachable
+      }
+      return out;
+    })();
+
+    this.binanceBatchPromise = p;
+    void p.finally(() => {
+      window.setTimeout(() => {
+        if (this.binanceBatchPromise === p) this.binanceBatchPromise = null;
+      }, 2500);
+    });
+    return p;
+  }
+
+  private static async fetchTgjuJson(asset: FinanceAssetId): Promise<PriceData | null> {
+    const def = FINANCE_ASSETS[asset];
+    if (!def.tgju) return null;
+    const url = `https://api.tgju.org/v1/market/indicator/summary-table-data/${def.tgju}?length=1`;
     const text = await this.fetchViaBackground(url);
     const json = JSON.parse(text) as TgjuSummaryResponse;
     const row = json.data?.[0];
-    if (!row || !Array.isArray(row)) return { price: 'Error', trend: 'flat' };
+    if (!row || !Array.isArray(row)) return null;
 
-    const rial = toRialNumber(row[3]); // close column
-    if (rial === null) return { price: 'Error', trend: 'flat' };
+    const rawNum = toPositiveNumber(row[3]);
+    if (rawNum === null) return null;
 
-    // Change direction: span class "high" → price rose, "low" → fell.
     const changeHtml = row[5] ?? '';
     let trend: PriceData['trend'] = 'flat';
     if (/class="high"/.test(changeHtml)) trend = 'up';
     else if (/class="low"/.test(changeHtml)) trend = 'down';
 
-    return { price: rial.toLocaleString('en-US'), trend };
-  }
-
-  static async fetchProfileData(url: string): Promise<PriceData> {
-    try {
-      const html = await this.fetchViaBackground(url);
-      const parsed = this.parseProfilePage(html);
-      if (parsed.price !== 'Error') return parsed;
-    } catch {
-      // fall through
-    }
-    return { price: 'Error', trend: 'flat' };
-  }
-
-  static parseProfilePage(html: string): PriceData {
-    try {
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(html, 'text/html');
-
-      let el = doc.querySelector('.info-price-left .value');
-      if (el) return { price: this.cleanPrice(el.textContent || ''), trend: 'flat' };
-
-      el = doc.querySelector('.price');
-      if (el && /\d/.test(normalizeDigits(el.textContent || ''))) {
-        return { price: this.cleanPrice(el.textContent || ''), trend: 'flat' };
+    const pctMatch = normalizeDigits(changeHtml).replace(/<[^>]+>/g, '').match(/[\d.]+/);
+    let changePercent: number | undefined;
+    if (pctMatch) {
+      const mag = parseFloat(pctMatch[0]);
+      if (Number.isFinite(mag) && mag > 0) {
+        changePercent = trend === 'down' ? -mag : mag;
       }
-
-      const rows = doc.querySelectorAll('tr');
-      for (const row of Array.from(rows)) {
-        const rowText = normalizeDigits(row.textContent || '');
-        if (rowText.includes('نرخ فعلی') || rowText.includes('Current')) {
-          const val = row.querySelector('td:nth-child(2), .value');
-          if (val) return { price: this.cleanPrice(val.textContent || ''), trend: 'flat' };
-        }
-      }
-    } catch {
-      // scraping error
     }
-    return { price: 'Error', trend: 'flat' };
+
+    if (def.unit === 'usd') {
+      return {
+        price: rawNum.toLocaleString('en-US', { maximumFractionDigits: rawNum >= 1000 ? 0 : 2 }),
+        numericValue: rawNum,
+        unit: 'usd',
+        trend,
+        changePercent,
+        source: 'TGJU'
+      };
+    }
+
+    return {
+      price: Math.round(rawNum).toLocaleString('en-US'),
+      numericValue: Math.round(rawNum / 10),
+      unit: 'toman',
+      trend,
+      changePercent,
+      source: 'TGJU'
+    };
   }
 
-  private static async fetchBrsAsset(asset: FinanceAssetId): Promise<PriceData> {
-    try {
-      const json = await this.fetchBrsApiJson();
-      const brsapiName = FINANCE_ASSETS[asset].brsapiName;
-      const item = json.currency?.find((c) => c.name?.toLowerCase() === brsapiName);
-      const rial = toRialNumber(item?.price);
-      if (rial !== null) {
-        return { price: rial.toLocaleString('en-US'), trend: 'flat' };
+  private static fetchTgjuAjaxBatch(): Promise<Record<string, TgjuAjaxItem>> {
+    if (this.tgjuAjaxPromise) return this.tgjuAjaxPromise;
+    const p = (async (): Promise<Record<string, TgjuAjaxItem>> => {
+      try {
+        const text = await this.fetchViaBackground(API_URLS.tgjuAjax);
+        const json = JSON.parse(text) as { current?: Record<string, TgjuAjaxItem> };
+        return json.current ?? {};
+      } catch {
+        return {};
       }
-    } catch {
-      // all sources exhausted
-    }
-    return { price: 'Error', trend: 'flat' };
+    })();
+
+    this.tgjuAjaxPromise = p;
+    void p.finally(() => {
+      window.setTimeout(() => {
+        if (this.tgjuAjaxPromise === p) this.tgjuAjaxPromise = null;
+      }, 2500);
+    });
+    return p;
   }
 
-  // brsapi /FreeTether/latest serves Rial-scale values for usd/gold keys.
-  private static async fetchBrsApiJson(): Promise<BrsApiResponse> {
-    const responseText = await this.fetchViaBackground(API_URLS.fallbackApi);
-    return JSON.parse(responseText) as BrsApiResponse;
+  private static async fetchTgjuAjaxAsset(asset: FinanceAssetId): Promise<PriceData | null> {
+    const def = FINANCE_ASSETS[asset];
+    if (!def.tgju) return null;
+    const current = await this.fetchTgjuAjaxBatch();
+    const item = current[def.tgju];
+    if (!item) return null;
+    const rawNum = toPositiveNumber(item.p);
+    if (rawNum === null) return null;
+
+    const dpNum = parseFloat(String(item.dp ?? ''));
+    let trend: PriceData['trend'] = 'flat';
+    if (item.dt === 'high') trend = 'up';
+    else if (item.dt === 'low') trend = 'down';
+
+    const changePercent =
+      Number.isFinite(dpNum) && dpNum !== 0
+        ? trend === 'down'
+          ? -Math.abs(dpNum)
+          : Math.abs(dpNum)
+        : undefined;
+
+    if (def.unit === 'usd') {
+      return {
+        price: rawNum.toLocaleString('en-US', { maximumFractionDigits: rawNum >= 1000 ? 0 : 2 }),
+        numericValue: rawNum,
+        unit: 'usd',
+        trend,
+        changePercent,
+        source: 'TGJU'
+      };
+    }
+
+    return {
+      price: Math.round(rawNum).toLocaleString('en-US'),
+      numericValue: Math.round(rawNum / 10),
+      unit: 'toman',
+      trend,
+      changePercent,
+      source: 'TGJU'
+    };
   }
 
   static cleanPrice(text: string): string {

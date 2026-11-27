@@ -16,10 +16,18 @@ interface TabInfo {
   windowId: number;
 }
 
+let tabsCache: { items: TabInfo[]; ts: number } | null = null;
+
 async function queryTabs(): Promise<TabInfo[]> {
   if (!hasChrome()) return [];
+  const now = Date.now();
+  if (tabsCache && now - tabsCache.ts < 4000) return tabsCache.items;
   return new Promise((resolve) => {
-    chrome.tabs.query({}, (tabs) => resolve(tabs as TabInfo[]));
+    chrome.tabs.query({}, (tabs) => {
+      const list = (tabs as TabInfo[]) || [];
+      tabsCache = { items: list, ts: Date.now() };
+      resolve(list);
+    });
   });
 }
 
@@ -115,10 +123,18 @@ interface TopSite {
   url?: string;
 }
 
+let topSitesCache: { items: TopSite[]; ts: number } | null = null;
+
 async function getTopSites(): Promise<TopSite[]> {
   if (!hasChrome() || !chrome.topSites) return [];
+  const now = Date.now();
+  if (topSitesCache && now - topSitesCache.ts < 10_000) return topSitesCache.items;
   return new Promise((resolve) => {
-    chrome.topSites.get((sites) => resolve(sites as TopSite[]));
+    chrome.topSites.get((sites) => {
+      const list = (sites as TopSite[]) || [];
+      topSitesCache = { items: list, ts: Date.now() };
+      resolve(list);
+    });
   });
 }
 

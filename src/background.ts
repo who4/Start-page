@@ -15,9 +15,10 @@ type Handler = (
   sendResponse: (response: BackgroundResponse) => void
 ) => void;
 
-// Only the newest suggestion request's response is delivered; stale fetches
-// still complete but their results are discarded.
+// Abort superseded suggestion fetches immediately so stale network requests never stall the worker.
 let suggestionGeneration = 0;
+let activeSuggestionAbort: AbortController | null = null;
+let activeSuggestionDone: ((res: BackgroundResponse) => void) | null = null;
 
 function extractFirstIconFromHtml(html: string, baseUrl: string): string[] {
   const head = html.match(/<head[\s\S]*?<\/head>/i)?.[0] ?? html.slice(0, 24000);
@@ -118,22 +119,56 @@ async function fetchImageAsDataUrl(url: string): Promise<string | null> {
 
 const handlers: Record<string, Handler> = {
   FETCH_SUGGESTIONS: (request: unknown, sendResponse) => {
-    const { query } = request as FetchSuggestionsRequest;
+    const { query, engine = 'google' } = request as FetchSuggestionsRequest;
     const generation = ++suggestionGeneration;
-    const targetUrl = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`;
 
-    fetchWithTimeout(targetUrl, {}, 3500)
-      .then((response) => response.json())
-      .then((data: unknown[]) => {
+    // Abort previous in-flight suggestion request and cleanly close its response channel
+    if (activeSuggestionAbort) {
+      activeSuggestionAbort.abort();
+      activeSuggestionAbort = null;
+    }
+    if (activeSuggestionDone) {
+      activeSuggestionDone({ success: true, data: [] } as SuccessResponse<string[]>);
+      activeSuggestionDone = null;
+    }
+
+    const controller = new AbortController();
+    activeSuggestionAbort = controller;
+    activeSuggestionDone = sendResponse;
+    const timeoutId = setTimeout(() => controller.abort(), 1800);
+
+    const eng = engine.toLowerCase();
+    const useDdg = eng === 'duckduckgo' || eng === 'brave' || eng === 'startpage' || eng === 'kagi';
+    const primaryUrl = useDdg
+      ? `https://duckduckgo.com/ac/?q=${encodeURIComponent(query)}&type=list`
+      : `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`;
+    const fallbackUrl = useDdg
+      ? `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(query)}`
+      : `https://duckduckgo.com/ac/?q=${encodeURIComponent(query)}&type=list`;
+
+    const fetchList = async (url: string): Promise<string[]> => {
+      const resp = await fetch(url, { signal: controller.signal });
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as unknown[];
+      return Array.isArray(data?.[1]) ? (data[1] as string[]) : [];
+    };
+
+    fetchList(primaryUrl)
+      .then(async (list) => (list.length > 0 ? list : await fetchList(fallbackUrl).catch(() => [])))
+      .catch(() => (controller.signal.aborted ? [] : fetchList(fallbackUrl).catch(() => [])))
+      .then((payload) => {
+        clearTimeout(timeoutId);
         if (generation !== suggestionGeneration) return;
-        const payload: string[] = Array.isArray(data[1]) ? data[1] : [];
-        const res: SuccessResponse<string[]> = { success: true, data: payload };
-        sendResponse(res);
+        activeSuggestionAbort = null;
+        activeSuggestionDone = null;
+        sendResponse({ success: true, data: payload } as SuccessResponse<string[]>);
       })
       .catch((error: Error) => {
+        clearTimeout(timeoutId);
         if (generation !== suggestionGeneration) return;
-        const res: ErrorResponse = { success: false, error: error.message };
-        sendResponse(res);
+        activeSuggestionAbort = null;
+        activeSuggestionDone = null;
+        sendResponse({ success: false, error: error.message } as ErrorResponse);
       });
   },
 
@@ -143,8 +178,12 @@ const handlers: Record<string, Handler> = {
     // URL allowlist — only allow hostnames matching host_permissions in manifest
     const ALLOWED_HOSTS = [
       'google.com',
+      'alanchand.com',
       'tgju.org',
-      'brsapi.ir',
+      'nobitex.ir',
+      'wallex.ir',
+      'binance.com',
+      'duckduckgo.com',
       'rss2json.com',
       'bbci.co.uk',
       'aljazeera.com',
@@ -346,64 +385,100 @@ if (typeof chrome !== 'undefined' && chrome.alarms) {
       const settings = settingsResult.settings as { finance?: { assets?: string[]; alerts?: Array<{ asset: string; above?: number; below?: number; enabled: boolean }> } } | undefined;
       const assets = settings?.finance?.assets || ['usd', 'gold'];
 
+      // Fetch Nobitex batch once if any nobitex-backed asset is enabled
+      let nobitexStats: Record<string, { latest?: string; dayChange?: string }> | null = null;
+      if (assets.some((id) => Boolean(FINANCE_ASSETS[id as keyof typeof FINANCE_ASSETS]?.nobitex))) {
+        try {
+          const nbResp = await fetchWithTimeout(
+            'https://apiv2.nobitex.ir/market/stats?srcCurrency=usdt,btc,eth&dstCurrency=rls,usdt',
+            {},
+            5000
+          );
+          if (nbResp.ok) {
+            const nbJson = (await nbResp.json()) as {
+              stats?: Record<string, { latest?: string; dayChange?: string }>;
+            };
+            nobitexStats = nbJson.stats ?? null;
+          }
+        } catch {
+          // continue to TGJU fallback
+        }
+      }
+
       for (const assetId of assets) {
         const assetDef = FINANCE_ASSETS[assetId as keyof typeof FINANCE_ASSETS];
         if (!assetDef) continue;
-        const symbol = assetDef.tgju;
         try {
-          const resp = await fetch(`https://api.tgju.org/v1/market/indicator/summary-table-data/${symbol}?length=1`);
-          const json = await resp.json();
-          const row = json.data?.[0];
-          if (!row || !Array.isArray(row)) continue;
-
-          const priceStr = String(row[3]).replace(/[^\d]/g, '');
-          const price = parseInt(priceStr, 10);
-          if (!Number.isFinite(price) || price <= 0) continue;
-
-          // NOTE: Trend detection depends on TGJU's HTML class="high"/"low" on the change cell.
-          // Fallback: if neither class matches, check for direction text (up/down) in the HTML
-          // before defaulting to flat.
-          const changeHtml = String(row[5] ?? '');
+          let storedValue = 0;
+          let displayValue = 0;
           let trend: 'up' | 'down' | 'flat' = 'flat';
-          if (/class="high"/.test(changeHtml)) {
-            trend = 'up';
-          } else if (/class="low"/.test(changeHtml)) {
-            trend = 'down';
-          } else if (/\b(up|rising|▲|⬆)/i.test(changeHtml)) {
-            trend = 'up';
-          } else if (/\b(down|falling|▼|⬇)/i.test(changeHtml)) {
-            trend = 'down';
+
+          if (assetDef.nobitex && nobitexStats?.[assetDef.nobitex]?.latest) {
+            const st = nobitexStats[assetDef.nobitex];
+            const latestNum = parseFloat(String(st.latest));
+            if (Number.isFinite(latestNum) && latestNum > 0) {
+              storedValue = assetDef.unit === 'toman' ? Math.round(latestNum) : latestNum;
+              displayValue = assetDef.unit === 'toman' ? latestNum / 10 : latestNum;
+              const ch = parseFloat(String(st.dayChange ?? '0'));
+              if (Number.isFinite(ch)) {
+                trend = ch > 0.05 ? 'up' : ch < -0.05 ? 'down' : 'flat';
+              }
+            }
           }
+
+          if (storedValue <= 0 && assetDef.tgju) {
+            const resp = await fetchWithTimeout(
+              `https://api.tgju.org/v1/market/indicator/summary-table-data/${assetDef.tgju}?length=1`,
+              {},
+              5000
+            );
+            const json = await resp.json();
+            const row = json.data?.[0];
+            if (!row || !Array.isArray(row)) continue;
+
+            const rawVal = parseFloat(String(row[3]).replace(/,/g, '').replace(/[^\d.]/g, ''));
+            if (!Number.isFinite(rawVal) || rawVal <= 0) continue;
+            storedValue = assetDef.unit === 'toman' ? Math.round(rawVal) : rawVal;
+            displayValue = assetDef.unit === 'toman' ? rawVal / 10 : rawVal;
+
+            const changeHtml = String(row[5] ?? '');
+            if (/class="high"/.test(changeHtml) || /\b(up|rising|▲|⬆)/i.test(changeHtml)) {
+              trend = 'up';
+            } else if (/class="low"/.test(changeHtml) || /\b(down|falling|▼|⬇)/i.test(changeHtml)) {
+              trend = 'down';
+            }
+          }
+
+          if (storedValue <= 0) continue;
 
           const historyKey = 'priceHistory';
           const historyResult = await chrome.storage.local.get([historyKey]);
           const store = (historyResult[historyKey] || {}) as Record<string, Array<{ t: number; p: number; trend: string }>>;
           const arr = store[assetId] || [];
-          arr.push({ t: Date.now(), p: price, trend });
+          arr.push({ t: Date.now(), p: storedValue, trend });
           if (arr.length > 720) arr.splice(0, arr.length - 720);
           store[assetId] = arr;
           await chrome.storage.local.set({ [historyKey]: store });
 
-          // Check threshold alerts
+          const unitLabel = assetDef.unit === 'usd' ? 'USD' : 'Toman';
           const alerts = settings?.finance?.alerts || [];
           for (const alert of alerts) {
             if (!alert.enabled || alert.asset !== assetId) continue;
-            const toman = price / 10;
-            if (alert.above && toman >= alert.above) {
+            if (alert.above && displayValue >= alert.above) {
               const aboveId = `alert-${assetId}-above-${Date.now()}`;
               chrome.notifications.create(aboveId, {
                 type: 'basic',
-                title: `${assetId.toUpperCase()} Alert`,
-                message: `${assetId.toUpperCase()} is above ${alert.above.toLocaleString()} Toman (${toman.toLocaleString()})`,
+                title: `${assetDef.code} Alert`,
+                message: `${assetDef.code} is above ${alert.above.toLocaleString()} ${unitLabel} (${displayValue.toLocaleString()})`,
                 priority: 2
               } as chrome.notifications.NotificationCreateOptions);
             }
-            if (alert.below && toman <= alert.below) {
+            if (alert.below && displayValue <= alert.below) {
               const belowId = `alert-${assetId}-below-${Date.now()}`;
               chrome.notifications.create(belowId, {
                 type: 'basic',
-                title: `${assetId.toUpperCase()} Alert`,
-                message: `${assetId.toUpperCase()} is below ${alert.below.toLocaleString()} Toman (${toman.toLocaleString()})`,
+                title: `${assetDef.code} Alert`,
+                message: `${assetDef.code} is below ${alert.below.toLocaleString()} ${unitLabel} (${displayValue.toLocaleString()})`,
                 priority: 2
               } as chrome.notifications.NotificationCreateOptions);
             }

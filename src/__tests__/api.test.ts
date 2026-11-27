@@ -29,26 +29,16 @@ describe('cleanPrice', () => {
   });
 });
 
-describe('parseProfilePage', () => {
-  it('reads .info-price-left .value', () => {
-    const html = '<div class="info-price-left"><span class="value">610,000</span></div>';
-    expect(ApiClient.parseProfilePage(html).price).toBe('610,000');
-  });
-
-  it('falls back to generic .price selector', () => {
-    expect(ApiClient.parseProfilePage('<div class="price">50,000</div>').price).toBe('50,000');
-  });
-
-  it('ignores .price without digits', () => {
-    expect(ApiClient.parseProfilePage('<div class="price">N/A</div>').price).toBe('Error');
-  });
-
-  it('scrapes table row with Persian current-rate label', () => {
-    const html = '<table><tr><td>نرخ فعلی</td><td>۷۰٬۰۰۰</td></tr></table>';
-    expect(ApiClient.parseProfilePage(html).price).toBe('70,000');
-  });
-
-  it('returns Error on empty doc', () => {
-    expect(ApiClient.parseProfilePage('<p>nothing</p>').price).toBe('Error');
+describe('FINANCE_ASSETS configuration', () => {
+  it('defines all six live market assets with units and endpoints', async () => {
+    const { FINANCE_ASSETS } = await import('../constants');
+    expect(FINANCE_ASSETS.usdt.unit).toBe('toman');
+    expect(FINANCE_ASSETS.usdt.nobitex).toBe('usdt-rls');
+    expect(FINANCE_ASSETS.usdt.wallex).toBe('USDTTMN');
+    expect(FINANCE_ASSETS.usd.tgju).toBe('price_dollar_rl');
+    expect(FINANCE_ASSETS.gold.tgju).toBe('geram18');
+    expect(FINANCE_ASSETS.eur.tgju).toBe('price_eur');
+    expect(FINANCE_ASSETS.btc.unit).toBe('usd');
+    expect(FINANCE_ASSETS.eth.unit).toBe('usd');
   });
 });
